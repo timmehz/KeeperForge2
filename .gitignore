@@ -1,0 +1,27 @@
+# Build and editor output
+out/
+.vs/
+# Visual Studio's resource editor cache (binary; holds the local path of the .rc file)
+*.aps
+
+# Private: assistant settings and instructions (local paths, private tools)
+.claude/
+CLAUDE.md
+
+# Docs that must not be shared
+# The game's own icon sheets, exported from its files: EA's artwork.
+docs/game/tab images/
+# Describes private decompiled exports of the official level editor, with local paths.
+docs/reference/editor-exports.md
+
+# Steamworks SDK: Valve's license forbids sharing it
+ThirdParty/
+
+# Per-user CMake and Visual Studio files
+CMakeUserPresets.json
+*.user
+*.suo
+build/
+# OS clutter
+Thumbs.db
+desktop.ini

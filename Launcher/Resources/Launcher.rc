@@ -1,0 +1,2 @@
+// The launcher's icon. Windows shows the first icon in the file for the exe.
+1 ICON "KeeperForge2Launcher.ico"
