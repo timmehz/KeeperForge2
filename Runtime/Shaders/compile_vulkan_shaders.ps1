@@ -31,7 +31,9 @@ $arrays = @(
 	(Compile 'FxaaFragment' 'fxaa.frag'),
 	(Compile 'SmaaEdgeFragment' 'smaa.frag' @('SMAA_PASS_EDGE')),
 	(Compile 'SmaaWeightFragment' 'smaa.frag' @('SMAA_PASS_WEIGHT')),
-	(Compile 'SmaaBlendFragment' 'smaa.frag' @('SMAA_PASS_BLEND'))
+	(Compile 'SmaaBlendFragment' 'smaa.frag' @('SMAA_PASS_BLEND')),
+	(Compile 'RayAoCompute' 'ray_ao.comp'),
+	(Compile 'RayBlurCompute' 'ray_blur.comp')
 )
 $body = $arrays -join "`n"
 $header = @"

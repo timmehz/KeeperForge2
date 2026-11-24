@@ -1,6 +1,12 @@
 #include "DirectDrawLayer.h"
+#include "ModelSmoothing.h"
+#include "RayScene.h"
+#include "ModelDetail.h"
+#include "RayTracing.h"
+#include "WidescreenCamera.h"
 #include "BackgroundRunning.h"
 #include "GameFixes.h"
+#include "WindowsMouse.h"
 #include "CrashHandler.h"
 #include "Logger.h"
 #include <Windows.h>
@@ -76,6 +82,64 @@ namespace KeeperForge2::Render::Layer {
 		// (gpuBlits); whole-frame clears done on the card (gpuClears). "clears" keeps only the clears, "off" neither.
 		bool gpuBlits = true;
 		bool gpuClears = true;
+		// config.yml ray_tracing, and its parts ray_tracing_occlusion and ray_tracing_shadows (RayScene.h,
+		// docs/game/ray-tracing.md).
+		bool rayTracing = false;
+		bool rayOcclusion = true;
+		bool rayShadows = true;
+		bool rayReflections = true;
+		bool rayBounce = true;
+		// ray_tracing_quality: the traced pictures are the frame's size divided by this (high 2, medium 3, low 4).
+		std::uint32_t rayDivisor = 3;
+		// config.yml ray_tracing_rate: traces a second at most (0: every frame); frames between show the last result.
+		std::uint32_t rayRate = 30;
+		// config.yml texture_filtering: the game's textures get mip levels (textureMipmaps, made here by HalveMip), and the
+		// backends' linear samplers take up to textureAnisotropy samples along a slanted view (1 = none).
+		bool textureMipmaps = true;
+		std::uint32_t textureAnisotropy = 16;
+		// config.yml model_smoothing: how many pieces a curved edge of the 3D world is cut into (ModelSmoothing.h); 0 off.
+		std::uint32_t smoothingSegments = 3;
+		bool smoothingLogged = false;
+
+		// The next mip level of a BGRA picture (alpha in the top byte), our own box filter: each texel is the average of
+		// the 2x2 it covers (an odd last row or column is left out; a side of 1 stays 1). Colors are weighted by alpha, so
+		// see-through texels do not bleed their color into the rest. binaryAlpha: every alpha of the texture is 0 or 255
+		// (cut-outs, which the alpha test drops); it stays so, a texel opaque when at least half of what it covers is, so
+		// cut-outs keep their shape far away instead of thinning out.
+		void HalveMip(const std::uint32_t* from, std::uint32_t width, std::uint32_t height, std::uint32_t* to, bool binaryAlpha) {
+			const std::uint32_t toWidth = MipLevelSize(width, 1);
+			const std::uint32_t toHeight = MipLevelSize(height, 1);
+			for (std::uint32_t y = 0; y < toHeight; ++y) {
+				const std::uint32_t y0 = std::min<std::uint32_t>(y * 2, height - 1);
+				const std::uint32_t y1 = std::min<std::uint32_t>(y * 2 + 1, height - 1);
+				for (std::uint32_t x = 0; x < toWidth; ++x) {
+					const std::uint32_t x0 = std::min<std::uint32_t>(x * 2, width - 1);
+					const std::uint32_t x1 = std::min<std::uint32_t>(x * 2 + 1, width - 1);
+					const std::uint32_t texels[4] = { from[y0 * width + x0], from[y0 * width + x1], from[y1 * width + x0], from[y1 * width + x1] };
+					std::uint32_t alphaSum = 0;
+					std::uint32_t opaque = 0;
+					std::uint32_t weighted[3]{};
+					std::uint32_t plain[3]{};
+					for (const std::uint32_t texel : texels) {
+						const std::uint32_t alpha = texel >> 24;
+						alphaSum += alpha;
+						if (alpha >= 128) ++opaque;
+						for (std::uint32_t channel = 0; channel < 3; ++channel) {
+							const std::uint32_t value = (texel >> (channel * 8)) & 0xFF;
+							weighted[channel] += value * alpha;
+							plain[channel] += value;
+						}
+					}
+					std::uint32_t result = 0;
+					for (std::uint32_t channel = 0; channel < 3; ++channel) {
+						const std::uint32_t value = alphaSum != 0 ? (weighted[channel] + alphaSum / 2) / alphaSum : (plain[channel] + 2) / 4;
+						result |= std::min<std::uint32_t>(value, 255) << (channel * 8);
+					}
+					const std::uint32_t alpha = binaryAlpha ? (opaque * 2 >= 4 ? 255u : 0u) : (alphaSum + 2) / 4;
+					to[y * toWidth + x] = result | alpha << 24;
+				}
+			}
+		}
 
 		// ---- Frame timing, for the log: where a frame's time goes. Reading the frame back from the graphics card
 		// waits for all the 3D work so far, so it is the cost to watch; every 10 s one line sums it up.
@@ -242,6 +306,11 @@ namespace KeeperForge2::Render::Layer {
 		PresentSource lastPresent = PresentSource::Frame;
 
 		bool EnsureBackend();
+		// Ray tracing: a solid draw's triangles kept for the frame's scene; at the end of the scene, the scene traced and
+		// its ambient occlusion laid over the frame; a scene never ended dropped before the frame is shown.
+		void RayCollect(const DrawState& state, const Vertex* vertices, std::uint32_t vertexCount, const std::uint16_t* indices, std::uint32_t indexCount);
+		void RayFinishScene();
+		void RayDropScene();
 		void MoveToWindow();
 		void PresentFrame();
 		void PresentSurface(SurfaceObject* surface);
@@ -283,6 +352,8 @@ namespace KeeperForge2::Render::Layer {
 				// Textures: the backend's copy, and whether the memory copy changed since it was made.
 				std::uint32_t gpuTexture = 0;
 				bool gpuDirty = true;
+				// How many mip levels gpuTexture has (texture_filtering; 1 for none).
+				std::uint32_t gpuLevels = 1;
 				// The render target: which copy is up to date.
 				bool cpuCurrent = true;
 				bool gpuCurrent = false;
@@ -989,8 +1060,11 @@ namespace KeeperForge2::Render::Layer {
 				std::snprintf(text, sizeof(text), "Renderer: the game's window got %s (wParam 0x%X)%s.", name, static_cast<unsigned>(wParam), IsIconic(handle) ? ", minimized" : "");
 				Logger::Trace(text);
 			}
+			// The mouse from Windows' messages (windows_mouse), before focus-loss messages may be held back below.
+			WindowsMouse::OnWindowMessage(handle, message, wParam, lParam);
 			if (message == WM_ACTIVATEAPP) appActive = wParam != 0;
 			if (message == WM_ACTIVATEAPP && wParam != 0) GameFixes::OnWindowActivated();
+			if (message == WM_CLOSE && GameFixes::OnWindowClose()) return 0;
 			// The game pauses when it is told it lost focus (0x558C70 runs its "inactive" callbacks on these three with
 			// a low word of 0). With background running those messages are held back, so it keeps running. They are
 			// handed to it just before focus comes back: what it lets go of on focus loss and sets up again on focus
@@ -1090,6 +1164,7 @@ namespace KeeperForge2::Render::Layer {
 				if (PresentVideoArea(renderTarget)) return;
 			}
 			LogPresent(PresentSource::Frame, renderTarget, Target(renderTarget->width, renderTarget->height));
+			RayDropScene();
 			if (!renderTarget->gpuCurrent) {
 				UploadFrameTimed(renderTarget->pixels.data(), renderTarget->Pitch());
 				renderTarget->gpuCurrent = true;
@@ -1386,7 +1461,11 @@ namespace KeeperForge2::Render::Layer {
 					}
 					return D3D_OK;
 				}
-				STDMETHOD(EndScene)() override { return D3D_OK; }
+				STDMETHOD(EndScene)() override {
+					Guard lock(layerMutex);
+					RayFinishScene();
+					return D3D_OK;
+				}
 				STDMETHOD(GetDirect3D)(LPDIRECT3D3* direct3D) override;
 				STDMETHOD(SetCurrentViewport)(LPDIRECT3DVIEWPORT3) override { return D3D_OK; }
 				STDMETHOD(GetCurrentViewport)(LPDIRECT3DVIEWPORT3* out) override {
@@ -1509,7 +1588,44 @@ namespace KeeperForge2::Render::Layer {
 				// Render::Vertex: inside this class "Vertex" is IDirect3DDevice3::Vertex.
 				std::vector<Render::Vertex> vertexScratch;
 				std::vector<std::uint16_t> indexScratch;
+				// model_smoothing: the draw's triangles before culling, and the smoothed vertices and triangles (after a smoothed
+				// draw, smoothVertices and smoothIndices hold the game's own, for the ray tracer).
+				std::vector<std::uint16_t> smoothInput;
+				std::vector<Render::Vertex> smoothVertices;
+				std::vector<std::uint16_t> smoothIndices;
+				// The 3D world: depth tested and written, not blended, and not water or lava (a bump mapping stage).
+				bool SmoothingFits() const {
+					const auto& rs = renderStates;
+					if (rs[D3DRENDERSTATE_ZENABLE] == D3DZB_FALSE || rs[D3DRENDERSTATE_ZWRITEENABLE] == 0 || rs[D3DRENDERSTATE_ALPHABLENDENABLE] != 0) return false;
+					for (std::size_t stage = 0; stage < StageCount; ++stage) {
+						const DWORD op = stageStates[stage][D3DTSS_COLOROP];
+						if (op == D3DTOP_DISABLE) break;
+						if (op == D3DTOP_BUMPENVMAP || op == D3DTOP_BUMPENVMAPLUMINANCE) return false;
+					}
+					return true;
+				}
+				// The engine's projection when it has one that fits the frame (as the ray tracer takes it); else the frame's
+				// middle and WidescreenCamera's focal length.
+				SmoothingProjection SmoothingCamera() const {
+					SmoothingProjection projection;
+					RayCamera camera{};
+					const float width = static_cast<float>(renderTarget->width);
+					const float height = static_cast<float>(renderTarget->height);
+					if (RayTracing::Camera(camera) && camera.centerX > 0.0f && camera.centerX < width && camera.centerY > 0.0f && camera.centerY < height) {
+						projection.focal = camera.focal;
+						projection.centerX = camera.centerX;
+						projection.centerY = camera.centerY;
+					}
+					else {
+						projection.focal = WidescreenCamera::FocalLength(renderTarget->height);
+						projection.centerX = width * 0.5f;
+						projection.centerY = height * 0.5f;
+					}
+					return projection;
+				}
 				std::vector<std::uint32_t> uploadScratch;
+				// Two mip levels at a time (UploadMips: the one being made and the one it is made from).
+				std::vector<std::uint32_t> mipScratch[2];
 
 				void Bind(DWORD stage, SurfaceObject* texture) {
 					if (texture == boundTextures[stage]) return;
@@ -1610,8 +1726,12 @@ namespace KeeperForge2::Render::Layer {
 				// Triangle lists (strips and fans unrolled) with the culled triangles left out. The vertices are in
 				// screen space, so the winding is known here; the backends never cull.
 				void BuildTriangles(D3DPRIMITIVETYPE type, const WORD* indices, DWORD indexCount, DWORD vertexCount) {
-					indexScratch.clear();
-					const DWORD cull = renderStates[D3DRENDERSTATE_CULLMODE];
+					ListTriangles(type, indices, indexCount, vertexCount, true, indexScratch);
+				}
+				// The draw's triangles as a list into out; with cull, without the ones facing away (as the cull mode says).
+				void ListTriangles(D3DPRIMITIVETYPE type, const WORD* indices, DWORD indexCount, DWORD vertexCount, bool culled, std::vector<std::uint16_t>& out) {
+					out.clear();
+					const DWORD cull = culled ? renderStates[D3DRENDERSTATE_CULLMODE] : static_cast<DWORD>(D3DCULL_NONE);
 					const auto add = [&](WORD a, WORD b, WORD c) {
 						if (a >= vertexCount || b >= vertexCount || c >= vertexCount) return;
 						if (cull == D3DCULL_CW || cull == D3DCULL_CCW) {
@@ -1623,9 +1743,9 @@ namespace KeeperForge2::Render::Layer {
 							if (cull == D3DCULL_CW && area > 0.0f) return;
 							if (cull == D3DCULL_CCW && area < 0.0f) return;
 						}
-						indexScratch.push_back(a);
-						indexScratch.push_back(b);
-						indexScratch.push_back(c);
+						out.push_back(a);
+						out.push_back(b);
+						out.push_back(c);
 					};
 					if (type == D3DPT_TRIANGLELIST) {
 						for (DWORD i = 0; i + 2 < indexCount; i += 3) add(indices[i], indices[i + 1], indices[i + 2]);
@@ -1729,27 +1849,63 @@ namespace KeeperForge2::Render::Layer {
 				std::uint32_t UploadTexture(SurfaceObject* texture) {
 					if (texture->kind == Kind::ZBuffer) return 0;
 					if (texture->gpuTexture == 0) {
-						texture->gpuTexture = backend->CreateTexture(texture->width, texture->height);
+						// texture_filtering: the game's own textures get mip levels (not bump maps, whose texels are offsets).
+						const bool mips = textureMipmaps && texture->kind == Kind::Texture && texture->bump == Bump::None && (texture->width > 1 || texture->height > 1);
+						texture->gpuLevels = mips ? MipLevelCount(texture->width, texture->height) : 1;
+						texture->gpuTexture = backend->CreateTexture(texture->width, texture->height, texture->gpuLevels);
+						if (texture->gpuTexture == 0 && texture->gpuLevels > 1) {
+							texture->gpuLevels = 1;
+							texture->gpuTexture = backend->CreateTexture(texture->width, texture->height);
+						}
 						texture->gpuDirty = true;
 					}
 					if (texture->gpuTexture != 0 && texture->gpuDirty) {
 						texture->PrepareRead();
+						const std::uint32_t* top = nullptr;
 						if (texture->bump != Bump::None) {
 							const auto* texels = reinterpret_cast<const std::uint16_t*>(texture->pixels.data());
 							uploadScratch.resize(static_cast<std::size_t>(texture->width) * texture->height);
 							for (std::size_t i = 0; i < uploadScratch.size(); ++i) uploadScratch[i] = BumpTexel(texels[i], texture->bump);
 							backend->UpdateTexture(texture->gpuTexture, uploadScratch.data(), texture->width * 4);
 						}
-						else if (texture->alpha) backend->UpdateTexture(texture->gpuTexture, texture->pixels.data(), texture->Pitch());
+						else if (texture->alpha) {
+							top = texture->pixels.data();
+							backend->UpdateTexture(texture->gpuTexture, top, texture->Pitch());
+						}
 						else {
 							// No alpha bits: whatever the game left there must read as opaque.
 							uploadScratch.resize(texture->pixels.size());
 							for (std::size_t i = 0; i < uploadScratch.size(); ++i) uploadScratch[i] = texture->pixels[i] | 0xFF000000;
-							backend->UpdateTexture(texture->gpuTexture, uploadScratch.data(), texture->Pitch());
+							top = uploadScratch.data();
+							backend->UpdateTexture(texture->gpuTexture, top, texture->Pitch());
 						}
+						if (top != nullptr && texture->gpuLevels > 1) UploadMips(texture, top);
 						texture->gpuDirty = false;
 					}
 					return texture->gpuTexture;
+				}
+				// The rest of a texture's mip levels from its picture (level 0, width x height, rows packed), each made from the
+				// one above it.
+				void UploadMips(SurfaceObject* texture, const std::uint32_t* top) {
+					const std::size_t count = static_cast<std::size_t>(texture->width) * texture->height;
+					bool binaryAlpha = true;
+					for (std::size_t i = 0; i < count && binaryAlpha; ++i) {
+						const std::uint32_t alpha = top[i] >> 24;
+						binaryAlpha = alpha == 0 || alpha == 255;
+					}
+					mipScratch[0].resize(count);
+					mipScratch[1].resize(count);
+					const std::uint32_t* from = top;
+					std::uint32_t width = texture->width;
+					std::uint32_t height = texture->height;
+					for (std::uint32_t level = 1; level < texture->gpuLevels; ++level) {
+						std::uint32_t* to = mipScratch[level & 1].data();
+						HalveMip(from, width, height, to, binaryAlpha);
+						width = MipLevelSize(width, 1);
+						height = MipLevelSize(height, 1);
+						backend->UpdateTexture(texture->gpuTexture, to, width * 4, level);
+						from = to;
+					}
 				}
 
 				HRESULT DoDraw(D3DPRIMITIVETYPE type, DWORD format, const void* vertices, DWORD vertexCount, const WORD* indices, DWORD indexCount) {
@@ -1758,13 +1914,38 @@ namespace KeeperForge2::Render::Layer {
 					if (!ConvertVertices(format, vertices, vertexCount)) return D3D_OK;
 					BuildTriangles(type, indices, indexCount, vertexCount);
 					if (indexScratch.empty()) return D3D_OK;
+					// model_smoothing: the triangles of creatures and objects (ModelDetail::DrawingModels: never terrain, which overlays are drawn on) made round, from all of them (the ones facing away too, so an
+					// outline's both sides are known), then culled again. The ray tracer keeps the game's own.
+					DWORD drawnCount = vertexCount;
+					bool smoothed = false;
+					if (smoothingSegments != 0 && ModelDetail::DrawingModels() && SmoothingFits()) {
+						ListTriangles(type, indices, indexCount, vertexCount, false, smoothInput);
+						if (SmoothTriangles(vertexScratch.data(), vertexCount, smoothInput.data(), static_cast<std::uint32_t>(smoothInput.size()), SmoothingCamera(),
+							smoothingSegments, smoothVertices, smoothIndices)) {
+							smoothed = true;
+							if (!smoothingLogged) {
+								smoothingLogged = true;
+								Logger::Debug("Renderer: model smoothing is drawing (first draw: " + std::to_string(smoothInput.size() / 3) + " triangles into "
+									+ std::to_string(smoothIndices.size() / 3) + ").");
+							}
+							vertexScratch.swap(smoothVertices);
+							indexScratch.swap(smoothIndices);
+							drawnCount = static_cast<DWORD>(vertexScratch.size());
+							// smoothIndices now holds the game's own triangles (culled), for the ray tracer.
+							ListTriangles(D3DPT_TRIANGLELIST, indexScratch.data(), static_cast<DWORD>(indexScratch.size()), drawnCount, true, smoothInput);
+							indexScratch.swap(smoothInput);
+							if (indexScratch.empty()) return D3D_OK;
+						}
+					}
 					if (!renderTarget->gpuCurrent) {
 						UploadFrameTimed(renderTarget->pixels.data(), renderTarget->Pitch());
 						renderTarget->gpuCurrent = true;
 					}
 					DrawState state;
 					MakeState(state);
-					backend->Draw(state, vertexScratch.data(), vertexCount, indexScratch.data(), static_cast<std::uint32_t>(indexScratch.size()));
+					backend->Draw(state, vertexScratch.data(), drawnCount, indexScratch.data(), static_cast<std::uint32_t>(indexScratch.size()));
+					if (smoothed) RayCollect(state, smoothVertices.data(), vertexCount, smoothIndices.data(), static_cast<std::uint32_t>(smoothIndices.size()));
+					else RayCollect(state, vertexScratch.data(), vertexCount, indexScratch.data(), static_cast<std::uint32_t>(indexScratch.size()));
 					renderTarget->cpuCurrent = false;
 					return D3D_OK;
 				}
@@ -2096,7 +2277,10 @@ namespace KeeperForge2::Render::Layer {
 		std::unique_ptr<Backend> StartBackend(Api api, HWND target, bool probe = false) {
 			auto made = CreateBackend(api);
 			if (!made) return nullptr;
-			if (!probe) made->SetAntiAliasing(antiAliasingSetting);
+			if (!probe) {
+				made->SetAntiAliasing(antiAliasingSetting);
+				made->SetAnisotropy(textureAnisotropy);
+			}
 			if (!made->Init(target)) return nullptr;
 			return made;
 		}
@@ -2338,6 +2522,286 @@ namespace KeeperForge2::Render::Layer {
 			}
 			return true;
 		}
+		// ---- Ray tracing (config.yml ray_tracing; RayScene.h; docs/game/ray-tracing.md). The scene is every solid draw of
+		// a Direct3D scene (depth tested and written, not blended: the world, not effects or the 2D panels). At EndScene
+		// it is traced at half the frame's size into a texture of how open each point is, which is then laid over the frame
+		// multiplying it (darker where closed in), before the game draws its panels.
+		RayScene rayScene;
+		std::uint32_t rayTexture = 0;
+		const Backend* rayTextureOwner = nullptr;
+		std::uint32_t rayTextureWidth = 0;
+		std::uint32_t rayTextureHeight = 0;
+		std::uint32_t rayTraces = 0;
+		bool rayFailureLogged = false;
+		bool rayDroppedLogged = false;
+		// Rays per pixel, how far they look in the scene's typical edges (a tile's side), and the fewest triangles worth
+		// tracing (fewer: a menu's picture, nothing to darken).
+		constexpr std::uint32_t RayAoRays = 6;
+		constexpr float RayAoReach = 1.0f;
+		constexpr std::uint32_t RayMinimumTriangles = 64;
+		// Traces logged: the first ones, then one in this many.
+		constexpr std::uint32_t RayLogEvery = 1800;
+
+		bool RayTracingActive() { return rayTracing && (rayOcclusion || rayShadows || rayReflections || rayBounce) && backend && backend->CanRayTrace(); }
+		// The engine's camera for the scene being collected (read when it starts), and the lights for shadows.
+		RayCamera rayCamera{};
+		bool rayCameraValid = false;
+		constexpr std::uint32_t RayMostLights = 64;
+		RayLightInfo rayLightInfos[RayMostLights];
+		std::vector<RayLight> rayLights;
+		// The light every point gets besides the scene's lights, against which shadows are weighed (a light's full share
+		// is about 1).
+		constexpr float RayAmbient = 0.35f;
+		// Reflections: how strongly they show, and how far their rays look (in typical edges, about tiles).
+		constexpr float RayReflectionStrength = 0.6f;
+		constexpr float RayReflectionReach = 12.0f;
+		// Bounce light: how strongly it is added, and how far its rays look (in typical edges).
+		constexpr float RayBounceStrength = 0.5f;
+		constexpr float RayBounceReach = 5.0f;
+		// The reflections' and the bounced light's textures (the same size as the lighting's).
+		std::uint32_t rayReflectionTexture = 0;
+		std::uint32_t rayBounceTexture = 0;
+		// ray_tracing_rate: a scene between traces is not collected (no triangles, no tree, no trace); at its end the last
+		// result is laid over the frame again, if it is recent and the frame's size has not changed.
+		bool raySkipping = false;
+		std::uint32_t raySkippedTriangles = 0;
+		std::int64_t rayLastTrace = 0;
+		std::uint32_t rayLastFrameWidth = 0;
+		std::uint32_t rayLastFrameHeight = 0;
+		bool rayLastLighting = false;
+		bool rayLastBouncing = false;
+		bool rayLastReflecting = false;
+		// A last result older than this is not shown again (the view has moved on).
+		constexpr double RayReuseMs = 250.0;
+		// Water and lava: the game bump maps them (a texture stage of BUMPENVMAP or BUMPENVMAPLUMINANCE).
+		bool RayMirror(const DrawState& state) {
+			for (int stage = 0; stage < 3; ++stage) {
+				const auto op = state.constants.colorOp[stage];
+				if (op == D3DTOP_BUMPENVMAP || op == D3DTOP_BUMPENVMAPLUMINANCE) return true;
+			}
+			return false;
+		}
+
+		void RayCollect(const DrawState& state, const Vertex* vertices, std::uint32_t vertexCount, const std::uint16_t* indices, std::uint32_t indexCount) {
+			if (!RayTracingActive() || !renderTarget) return;
+			// Solid draws (the world), and water and lava even when blended (they reflect; other rays pass through them).
+			const bool mirror = RayMirror(state);
+			if (!state.depthTest || (!mirror && (state.blend || !state.depthWrite))) return;
+			if (raySkipping) {
+				raySkippedTriangles += indexCount / 3;
+				return;
+			}
+			if (!rayScene.Begun() && rayRate != 0 && rayLastTrace != 0 && TicksToMs(Ticks() - rayLastTrace) < 1000.0 / rayRate) {
+				raySkipping = true;
+				raySkippedTriangles = indexCount / 3;
+				return;
+			}
+			if (!rayScene.Begun()) {
+				// The engine's own projection when it has one that fits this frame; else the middle and WidescreenCamera's
+				// focal length.
+				rayCameraValid = RayTracing::Camera(rayCamera) && rayCamera.centerX > 0.0f && rayCamera.centerX < static_cast<float>(renderTarget->width)
+					&& rayCamera.centerY > 0.0f && rayCamera.centerY < static_cast<float>(renderTarget->height);
+				if (rayCameraValid) rayScene.Begin(renderTarget->width, renderTarget->height, rayCamera.focal, rayCamera.centerX, rayCamera.centerY);
+				else {
+					rayScene.Begin(renderTarget->width, renderTarget->height, WidescreenCamera::FocalLength(renderTarget->height),
+						static_cast<float>(renderTarget->width) * 0.5f, static_cast<float>(renderTarget->height) * 0.5f);
+				}
+			}
+			rayScene.Add(vertices, vertexCount, indices, indexCount, mirror ? RayMaterialMirror : RayMaterialSolid);
+		}
+
+		void RayDropScene() {
+			raySkipping = false;
+			if (!rayScene.Begun()) return;
+			if (!rayDroppedLogged && rayScene.TriangleCount() >= RayMinimumTriangles) {
+				rayDroppedLogged = true;
+				Logger::Debug("Ray tracing: a frame was shown with its scene never ended (" + std::to_string(rayScene.TriangleCount()) + " triangles); not traced.");
+			}
+			rayScene.Clear();
+		}
+
+		// The trace's results laid over the frame: the lighting multiplied in, the bounced light added in its own color, the
+		// reflections mixed in by their alpha.
+		void RayDrawOverlay(bool lighting, bool bouncing, bool reflecting) {
+			// Laid over the frame: color times the texture (blend zero and source color), stretched with linear sampling.
+			DrawState state;
+			state.blend = true;
+			state.source = Blend::Zero;
+			state.destination = Blend::SrcColor;
+			state.depthTest = false;
+			state.depthWrite = false;
+			state.depthFunc = Compare::Always;
+			ShaderConstants& constants = state.constants;
+			std::memset(&constants, 0, sizeof(constants));
+			for (int stage = 0; stage < 4; ++stage) {
+				constants.colorOp[stage] = D3DTOP_DISABLE;
+				constants.alphaOp[stage] = D3DTOP_DISABLE;
+			}
+			constants.colorOp[0] = D3DTOP_SELECTARG1;
+			constants.colorArg1[0] = D3DTA_TEXTURE;
+			constants.alphaOp[0] = D3DTOP_SELECTARG1;
+			constants.alphaArg1[0] = D3DTA_TEXTURE;
+			constants.misc[1] = 1;
+			const float frameWidth = static_cast<float>(renderTarget->width);
+			const float frameHeight = static_cast<float>(renderTarget->height);
+			constants.view[0] = 2.0f / frameWidth;
+			constants.view[1] = backend->FlipsY() ? 2.0f / frameHeight : -2.0f / frameHeight;
+			constants.view[2] = backend->FlipsY() ? -1.0f : 1.0f;
+			constants.depth[0] = 1.0f;
+			state.samplers[0] = { Address::Clamp, Address::Clamp, true };
+			state.textures[0] = rayTexture;
+			// The shaders add half a pixel, so corners half a pixel back cover the whole frame.
+			Render::Vertex corners[4]{};
+			const float places[4][4] = { { -0.5f, -0.5f, 0.0f, 0.0f }, { frameWidth - 0.5f, -0.5f, 1.0f, 0.0f },
+				{ -0.5f, frameHeight - 0.5f, 0.0f, 1.0f }, { frameWidth - 0.5f, frameHeight - 0.5f, 1.0f, 1.0f } };
+			for (int i = 0; i < 4; ++i) {
+				corners[i].x = places[i][0];
+				corners[i].y = places[i][1];
+				corners[i].rhw = 1.0f;
+				corners[i].diffuse = 0xFFFFFFFF;
+				corners[i].uv[0][0] = places[i][2];
+				corners[i].uv[0][1] = places[i][3];
+			}
+			const std::uint16_t quad[6] = { 0, 1, 2, 2, 1, 3 };
+			if (lighting) backend->Draw(state, corners, 4, quad, 6);
+			// The bounced light: each pixel brightened by it in its own color (blend dest color and one: frame * (1 +
+			// bounce)), as the surface's own color would take the light that arrives.
+			if (bouncing) {
+				state.source = Blend::DestColor;
+				state.destination = Blend::One;
+				state.textures[0] = rayBounceTexture;
+				backend->Draw(state, corners, 4, quad, 6);
+			}
+			// Then the reflections, mixed in by their alpha (0 where nothing reflects).
+			if (reflecting) {
+				state.source = Blend::SrcAlpha;
+				state.destination = Blend::InvSrcAlpha;
+				state.textures[0] = rayReflectionTexture;
+				backend->Draw(state, corners, 4, quad, 6);
+			}
+			renderTarget->cpuCurrent = false;
+		}
+		// Between traces (ray_tracing_rate): the last result again, when it is recent and fits this frame.
+		void RayShowLast() {
+			if (!RayTracingActive() || !renderTarget || !renderTarget->gpuCurrent || raySkippedTriangles < RayMinimumTriangles) return;
+			if (rayTextureOwner != backend.get() || rayTexture == 0 || rayLastTrace == 0) return;
+			if (rayLastFrameWidth != renderTarget->width || rayLastFrameHeight != renderTarget->height) return;
+			if (TicksToMs(Ticks() - rayLastTrace) > RayReuseMs) return;
+			RayDrawOverlay(rayLastLighting, rayLastBouncing, rayLastReflecting);
+		}
+
+		void RayFinishScene() {
+			if (raySkipping) {
+				raySkipping = false;
+				RayShowLast();
+				return;
+			}
+			if (!rayScene.Begun()) return;
+			if (!RayTracingActive() || !renderTarget || !renderTarget->gpuCurrent || rayScene.TriangleCount() < RayMinimumTriangles
+				|| rayScene.Width() != renderTarget->width || rayScene.Height() != renderTarget->height) {
+				rayScene.Clear();
+				return;
+			}
+			const std::int64_t started = Ticks();
+			rayScene.Build();
+			const double buildMs = TicksToMs(Ticks() - started);
+			const std::uint32_t width = (renderTarget->width + rayDivisor - 1) / rayDivisor;
+			const std::uint32_t height = (renderTarget->height + rayDivisor - 1) / rayDivisor;
+			// Checkerboard (see ray_ao.comp): every pixel when the buffers are new or the last trace is too old to fill in
+			// the other half.
+			bool traceAll = rayLastTrace == 0 || TicksToMs(Ticks() - rayLastTrace) > RayReuseMs
+				|| rayLastFrameWidth != renderTarget->width || rayLastFrameHeight != renderTarget->height;
+			if (rayTextureOwner != backend.get() || rayTextureWidth != width || rayTextureHeight != height) {
+				traceAll = true;
+				// Textures of a backend that is gone (switched) went with it.
+				if (rayTextureOwner == backend.get()) {
+					for (const std::uint32_t texture : { rayTexture, rayReflectionTexture, rayBounceTexture }) if (texture != 0) backend->DestroyTexture(texture);
+				}
+				rayTexture = backend->CreateTexture(width, height);
+				rayReflectionTexture = backend->CreateTexture(width, height);
+				rayBounceTexture = backend->CreateTexture(width, height);
+				rayTextureOwner = backend.get();
+				rayTextureWidth = width;
+				rayTextureHeight = height;
+			}
+			if (rayTexture == 0) {
+				rayScene.Clear();
+				return;
+			}
+			const RaySceneData data = rayScene.Data();
+			RayTraceSettings settings;
+			settings.width = width;
+			settings.height = height;
+			settings.frameWidth = static_cast<float>(renderTarget->width);
+			settings.frameHeight = static_cast<float>(renderTarget->height);
+			settings.centerX = rayScene.CenterX();
+			settings.centerY = rayScene.CenterY();
+			settings.focal = rayScene.Focal();
+			settings.radius = (std::max)(rayScene.TypicalEdge() * RayAoReach, 1e-6f);
+			// Fewer rays where fewer pixels are traced anyway: high 6, medium 4, low 3 (bounce light takes half, at least 2).
+			settings.rays = rayDivisor <= 2 ? RayAoRays : rayDivisor == 3 ? 4u : 3u;
+			settings.frame = (rayTraces & 1u) | (traceAll ? 2u : 0u);
+			settings.nodeCount = data.nodeCount;
+			settings.triangleCount = data.triangleCount;
+			settings.occlusion = rayOcclusion ? 1.0f : 0.0f;
+			settings.shadows = rayShadows ? 1.0f : 0.0f;
+			settings.ambient = RayAmbient;
+			settings.reflections = rayReflections ? RayReflectionStrength : 0.0f;
+			settings.reflectReach = (std::max)(rayScene.TypicalEdge(), 0.05f) * RayReflectionReach;
+			settings.bounce = rayBounce ? RayBounceStrength : 0.0f;
+			settings.bounceReach = (std::max)(rayScene.TypicalEdge(), 0.05f) * RayBounceReach;
+			// The level's lights near what the camera sees, in the scene's space.
+			RaySceneData traced = data;
+			rayLights.clear();
+			if (rayShadows && rayCameraValid) {
+				const std::uint32_t count = RayTracing::Lights(rayCamera, settings.frameWidth, settings.frameHeight, rayLightInfos, RayMostLights);
+				for (std::uint32_t i = 0; i < count; ++i) {
+					const RayLightInfo& info = rayLightInfos[i];
+					rayLights.push_back({ { info.position[0], info.position[1], info.position[2] }, info.radius, { info.color[0], info.color[1], info.color[2] }, info.strength });
+				}
+			}
+			traced.lights = rayLights.data();
+			traced.lightCount = static_cast<std::uint32_t>(rayLights.size());
+			settings.lightCount = traced.lightCount;
+			const bool reflecting = rayReflections && rayReflectionTexture != 0;
+			const bool bouncing = rayBounce && rayBounceTexture != 0;
+			if (!backend->TraceAmbientOcclusion(traced, settings, rayTexture, reflecting ? rayReflectionTexture : 0, bouncing ? rayBounceTexture : 0)) {
+				if (!rayFailureLogged) {
+					rayFailureLogged = true;
+					Logger::Warning(std::string("Ray tracing: ") + backend->Name() + " could not trace a frame; the picture is shown without it.");
+				}
+				rayScene.Clear();
+				return;
+			}
+
+			rayLastTrace = Ticks();
+			rayLastFrameWidth = renderTarget->width;
+			rayLastFrameHeight = renderTarget->height;
+			rayLastLighting = rayOcclusion || rayShadows;
+			rayLastBouncing = bouncing;
+			rayLastReflecting = reflecting;
+			RayDrawOverlay(rayLastLighting, rayLastBouncing, rayLastReflecting);
+
+			if (rayTraces < 3 || rayTraces % RayLogEvery == 0) {
+				char line[256];
+				std::snprintf(line, sizeof(line), "Ray tracing: %ux%u from %u triangles (%u tree nodes, built in %.2f ms), %u lights, focal %.1f, middle %.1f,%.1f (%s), reach %.4g.",
+					width, height, data.triangleCount, data.nodeCount, buildMs, settings.lightCount, settings.focal, settings.centerX, settings.centerY,
+					rayCameraValid ? "engine" : "guessed", settings.radius);
+				Logger::Debug(line);
+				// Where the first light is, to check the world-to-camera turn: in front (z > 0) and near the picture.
+				if (!rayLights.empty()) {
+					const RayLight& light = rayLights.front();
+					const float z = light.position[2];
+					std::snprintf(line, sizeof(line), "Ray tracing: nearest light at %.2f,%.2f,%.2f (camera space), reach %.2f, color %.2f %.2f %.2f, strength %.2f, on screen at %.0f,%.0f.",
+						light.position[0], light.position[1], z, light.radius, light.color[0], light.color[1], light.color[2], light.strength,
+						z > 0.01f ? settings.centerX + settings.focal * light.position[0] / z : -1.0f, z > 0.01f ? settings.centerY + settings.focal * light.position[1] / z : -1.0f);
+					Logger::Debug(line);
+				}
+			}
+			++rayTraces;
+			rayScene.Clear();
+		}
+
 		bool EnsureBackend() {
 			if (backend) return true;
 			if (backendFailed || !window || !IsWindow(window)) return false;
@@ -2496,6 +2960,17 @@ namespace KeeperForge2::Render::Layer {
 
 	void SetBumpMapping(int mode) { bumpMode = mode; }
 
+	void SetRayTracing(bool on, bool occlusion, bool shadows, bool reflections, bool bounce, std::uint32_t divisor, std::uint32_t rate) {
+		Guard lock(layerMutex);
+		rayTracing = on;
+		rayOcclusion = occlusion;
+		rayShadows = shadows;
+		rayReflections = reflections;
+		rayBounce = bounce;
+		rayDivisor = std::clamp<std::uint32_t>(divisor, 1, 8);
+		rayRate = rate;
+	}
+
 	void SetGpuBlits(bool blits, bool clears) {
 		Guard lock(layerMutex);
 		gpuBlits = blits;
@@ -2505,5 +2980,16 @@ namespace KeeperForge2::Render::Layer {
 	void SetAntiAliasing(const AntiAliasing& value) {
 		Guard lock(layerMutex);
 		antiAliasingSetting = value;
+	}
+
+	void SetModelSmoothing(std::uint32_t segments) {
+		Guard lock(layerMutex);
+		smoothingSegments = segments == 0 ? 0 : std::clamp<std::uint32_t>(segments, 2, 4);
+	}
+
+	void SetTextureFiltering(bool mipmaps, std::uint32_t anisotropy) {
+		Guard lock(layerMutex);
+		textureMipmaps = mipmaps;
+		textureAnisotropy = std::clamp<std::uint32_t>(anisotropy, 1, 16);
 	}
 }

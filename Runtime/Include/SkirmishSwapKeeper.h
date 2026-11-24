@@ -6,5 +6,8 @@ namespace KeeperForge2 {
 	class SkirmishSwapKeeper {
 		public:
 			static void Install();
+			// Whether the skirmish screen's setup (0x538AC0) is hooked here; its hook then calls
+			// CustomCampaign::AfterSkirmishSetup, as there can be only one hook on it.
+			static bool SetupHooked();
 	};
 }

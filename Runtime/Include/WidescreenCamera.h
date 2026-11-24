@@ -11,5 +11,8 @@ namespace KeeperForge2 {
 			static void Install(std::uint32_t fieldOfViewPercent);
 			// Called after the game sets a screen mode.
 			static void OnScreenMode(std::int32_t height);
+			// The 3D camera's focal length in pixels for a frame this tall (the ray tracer turns the game's projected
+			// triangles back into camera space with it): as last set, scaled to height; the game's own 320 before then.
+			static float FocalLength(std::uint32_t height);
 	};
 }

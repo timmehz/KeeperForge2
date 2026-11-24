@@ -160,8 +160,9 @@ our export of DKII-DX.exe; what is untested is how they behave.
   or a player has a result. They stop if the world has stopped.
 
 ## Known gaps
-- Reported, cause not found: a King picked up as the Good player did not show in the hand.
-  The ownership checks treat all creatures alike, so it may be the King's own data. CoopHands
+- Reported: a King picked up as the Good player did not show in the hand. Found (2026-11-18): the stock
+  creature list has no In Hand animation for the King or the Stone Knight; GameFixes now uses their Stunned pose
+  (game-fixes.md, "King and Stone Knight show nothing in the hand"). CoopHands
   logs each thing taken, with its type and owner, to tell these apart.
 - None of this has been played on two machines. The hand, possession and desync code
   cannot be tested alone.

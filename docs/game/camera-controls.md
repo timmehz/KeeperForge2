@@ -40,8 +40,11 @@
   dropped, as the zoom actions are not polled in menus.
 - [unverified] Zoom per notch: 6 polls of 0x400 is about Flame's direct camera
   zoom of 50 per wheel unit, if the two use the same units.
-- Windows' WM_MOUSEWHEEL is not used: DirectInput's exclusive mouse can hold it
-  back. [unverified for this game; reference: Flame reads both]
+- Windows' WM_MOUSEWHEEL is not used with the DirectInput mouse: its exclusive
+  mode can hold it back. [unverified for this game; reference: Flame reads both]
+  With `windows_mouse` on there is no DirectInput mouse, so WindowsMouse hands
+  WM_MOUSEWHEEL and WM_MBUTTONDOWN to the same wheel zoom and middle click
+  reset (game/mouse.md).
 
 ## Middle click camera reset
 - Setting `middle_click_camera_reset` (default on). Pressing the middle mouse
@@ -89,3 +92,12 @@
   one to it, the middle button also does that.
 
 Not tested yet.
+
+## Wider zoom (wide_zoom)
+- The camera's zoom by an amount is 0x449CA0, thiscall (camera, amount) ret 4 (raw bytes in our export; disassembled
+  with ml + dumpbin) [verified]. It does nothing while the camera is held (+ 0xD92 bit 8, or a move under way at
+  + 0xDD8). Otherwise zoom (+ 0xD80) += amount, kept from the minimum (+ 0xD50) to the maximum (+ 0xD54) - 1. The zoom
+  keys and the mouse wheel (through the zoom key action) both end up there.
+- With `wide_zoom: on` (default) it is hooked: the minimum is lowered by 2000 when it is above 2000, the maximum raised
+  by 50000, the game's own code runs, and both are put back. Flame's amounts [reference: Flame increase_zoom_level].
+  Other code that reads the limits (setting the zoom directly, the level's starting view) sees the game's own.

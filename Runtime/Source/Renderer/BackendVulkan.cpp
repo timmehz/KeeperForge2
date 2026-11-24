@@ -1,13 +1,16 @@
 #include "Backend.h"
 #include "VulkanApi.h"
 #include "VulkanShaders.h"
+#include "Config.h"
 #include "Logger.h"
+#include "StringUtils.h"
 #include <Windows.h>
 #include <algorithm>
 #include <cstring>
 #include <initializer_list>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 // Vulkan 1.0. Commands are recorded into one of two command buffers (two frames in flight); everything a frame writes
@@ -20,6 +23,12 @@ namespace KeeperForge2::Render {
 		constexpr std::uint32_t SpirvMagic = 0x07230203;
 		constexpr DeviceSize RingSize = 32ull * 1024 * 1024;
 		constexpr std::uint32_t SetsPerFrame = 4096;
+		// The ray tracer's descriptor sets per frame (one per trace; when they run out, the frame's work so far is sent and
+		// they start over), and its bindings: tree, triangles, the trace's result, the blurred result, lights (storage
+		// buffers), the frame (a sampled picture), the reflections, the bounced light before and after smoothing (storage).
+		constexpr std::uint32_t RaySetsPerFrame = 64;
+		constexpr std::uint32_t RayBindings = 9;
+		constexpr std::uint32_t RayFrameBinding = 5;
 		constexpr DeviceSize UniformAlignment = 256;
 		constexpr std::uint64_t Forever = ~0ull;
 
@@ -52,7 +61,17 @@ namespace KeeperForge2::Render {
 					const float priority = 1.0f;
 					DeviceQueueCreateInfoData queueInfo{ DeviceQueueCreateInfo, nullptr, 0, queueFamily, 1, &priority };
 					const char* deviceExtensions[] = { "VK_KHR_swapchain" };
-					DeviceCreateInfoData deviceInfo{ DeviceCreateInfo, nullptr, 0, 1, &queueInfo, 0, nullptr, 1, deviceExtensions, nullptr };
+					// VkPhysicalDeviceFeatures (PhysicalDeviceFeatureCount Bool32s): only samplerAnisotropy is turned on, when the
+					// device has it and texture_filtering asks for it. A device with it allows at least 16 (Vulkan's minimum limit).
+					Bool32 features[PhysicalDeviceFeatureCount]{};
+					if (anisotropy > 1) {
+						Bool32 offered[PhysicalDeviceFeatureCount]{};
+						vk.GetPhysicalDeviceFeatures(physical, offered);
+						features[FeatureSamplerAnisotropy] = offered[FeatureSamplerAnisotropy];
+						anisotropyEnabled = offered[FeatureSamplerAnisotropy] != 0;
+						if (!anisotropyEnabled) Logger::Info("Renderer: this Vulkan device has no anisotropic filtering; textures use trilinear filtering.");
+					}
+					DeviceCreateInfoData deviceInfo{ DeviceCreateInfo, nullptr, 0, 1, &queueInfo, 0, nullptr, 1, deviceExtensions, features };
 					if (vk.CreateDevice(physical, &deviceInfo, nullptr, &device) != Success) return Fail("could not make a device");
 					if (!LoadDeviceFunctions()) return Fail("device is missing functions");
 					vk.GetDeviceQueue(device, queueFamily, 0, &queue);
@@ -111,10 +130,10 @@ namespace KeeperForge2::Render {
 					return true;
 				}
 
-				std::uint32_t CreateTexture(std::uint32_t width, std::uint32_t height) override {
+				std::uint32_t CreateTexture(std::uint32_t width, std::uint32_t height, std::uint32_t levels = 1) override {
 					ImageResource texture;
 					// Copied from as well, for ReadTexture.
-					if (!MakeImage(texture, width, height, FormatB8G8R8A8Unorm, ImageUsageSampled | ImageUsageTransferDst | ImageUsageTransferSrc, AspectColor)) return 0;
+					if (!MakeImage(texture, width, height, FormatB8G8R8A8Unorm, ImageUsageSampled | ImageUsageTransferDst | ImageUsageTransferSrc, AspectColor, 1, levels)) return 0;
 					CommandBuffer commands = Commands();
 					EndPass();
 					Barrier(commands, texture.image, AspectColor, LayoutUndefined, LayoutShaderReadOnly, 0, AccessShaderRead, StageTopOfPipe, StageFragmentShader);
@@ -122,19 +141,22 @@ namespace KeeperForge2::Render {
 					textures[handle] = texture;
 					return handle;
 				}
-				void UpdateTexture(std::uint32_t texture, const void* pixels, std::uint32_t pitch) override {
+				void UpdateTexture(std::uint32_t texture, const void* pixels, std::uint32_t pitch, std::uint32_t level = 0) override {
 					const auto found = textures.find(texture);
 					if (found == textures.end()) return;
 					const ImageResource image = found->second;
-					const DeviceSize size = static_cast<DeviceSize>(image.width) * image.height * 4;
+					if (level >= image.levels) return;
+					const std::uint32_t width = MipLevelSize(image.width, level);
+					const std::uint32_t height = MipLevelSize(image.height, level);
+					const DeviceSize size = static_cast<DeviceSize>(width) * height * 4;
 					std::uint8_t* written = nullptr;
 					const DeviceSize offset = RingAllocate(size, 16, written);
 					if (!written) return;
-					for (std::uint32_t y = 0; y < image.height; ++y) std::memcpy(written + static_cast<std::size_t>(y) * image.width * 4, static_cast<const std::uint8_t*>(pixels) + static_cast<std::size_t>(y) * pitch, static_cast<std::size_t>(image.width) * 4);
+					for (std::uint32_t y = 0; y < height; ++y) std::memcpy(written + static_cast<std::size_t>(y) * width * 4, static_cast<const std::uint8_t*>(pixels) + static_cast<std::size_t>(y) * pitch, static_cast<std::size_t>(width) * 4);
 					CommandBuffer commands = Commands();
 					EndPass();
 					Barrier(commands, image.image, AspectColor, LayoutShaderReadOnly, LayoutTransferDst, AccessShaderRead, AccessTransferWrite, StageFragmentShader, StageTransfer);
-					CopyIn(commands, Slot().ring.buffer, offset, image);
+					CopyIn(commands, Slot().ring.buffer, offset, image, level);
 					Barrier(commands, image.image, AspectColor, LayoutTransferDst, LayoutShaderReadOnly, AccessTransferWrite, AccessShaderRead, StageTransfer, StageFragmentShader);
 				}
 				void CopyFrameToTexture(std::uint32_t texture, std::uint32_t x, std::uint32_t y, std::uint32_t width, std::uint32_t height, std::uint32_t toX, std::uint32_t toY) override {
@@ -332,6 +354,118 @@ namespace KeeperForge2::Render {
 					if (msaaColor.image) frameUnresolved = true;
 				}
 
+				// ---- The ray tracer (RayScene.h, docs/game/ray-tracing.md): two compute passes over the scene uploaded into
+				// this frame's ring (tracing at the result's size, then the edge-keeping blur), the result copied into the texture.
+				bool CanRayTrace() const override {
+					return !rayFailed && VulkanShaders::RayAoCompute[0] == SpirvMagic && VulkanShaders::RayBlurCompute[0] == SpirvMagic;
+				}
+				bool TraceAmbientOcclusion(const RaySceneData& scene, const RayTraceSettings& settings, std::uint32_t texture, std::uint32_t reflectionTexture,
+					std::uint32_t bounceTexture) override {
+					if (!CanRayTrace() || scene.nodeCount == 0 || settings.width == 0 || settings.height == 0) return false;
+					if (!rayReady && !MakeRayObjects()) {
+						rayFailed = true;
+						return false;
+					}
+					const auto found = textures.find(texture);
+					if (found == textures.end() || found->second.width != settings.width || found->second.height != settings.height) return false;
+					const ImageResource image = found->second;
+					// The reflections' texture: the same size, or none (then their buffer is filled but not copied).
+					// The reflections' and the bounced light's textures: the same size, or none (then their buffers are filled
+					// but not copied).
+					const auto sameSize = [&](std::uint32_t handle) {
+						const auto other = handle != 0 ? textures.find(handle) : textures.end();
+						return other != textures.end() && other->second.width == settings.width && other->second.height == settings.height ? other->second : ImageResource{};
+					};
+					const ImageResource reflectionImage = sameSize(reflectionTexture);
+					const ImageResource bounceImage = sameSize(bounceTexture);
+					if (!MakeRayBuffers(settings.width, settings.height)) return false;
+
+					// The tree, the triangles and the lights in one piece of the ring (one request, so a full ring cannot split
+					// them). A buffer with nothing in it still gets a little room: a descriptor's range cannot be 0.
+					const DeviceSize nodeBytes = static_cast<DeviceSize>(scene.nodeCount) * sizeof(RayNode);
+					const DeviceSize triangleBytes = (std::max<DeviceSize>)(static_cast<DeviceSize>(scene.triangleCount) * sizeof(RayTriangle), 16);
+					const DeviceSize lightBytes = (std::max<DeviceSize>)(static_cast<DeviceSize>(scene.lightCount) * sizeof(RayLight), 32);
+					const DeviceSize triangleStart = AlignUp(nodeBytes, UniformAlignment);
+					const DeviceSize lightStart = AlignUp(triangleStart + triangleBytes, UniformAlignment);
+					// The set is taken first: when this frame's sets are used up, its work so far is sent and they start over,
+					// which also starts the ring over, so the upload comes after.
+					DescriptorSet set = 0;
+					for (int attempt = 0; attempt < 2 && set == 0; ++attempt) {
+						Commands();
+						if (attempt > 0) FlushAndWait();
+						DescriptorSetAllocateInfoData allocateInfo{ DescriptorSetAllocateInfo, nullptr, Slot().rayDescriptors, 1, &raySetLayout };
+						if (vk.AllocateDescriptorSets(device, &allocateInfo, &set) != Success) set = 0;
+					}
+					if (set == 0) return false;
+					// A ring that fills up here is sent and started over too (its piece then starts at 0), and the set with it:
+					// the set is then taken again (at 0 without a restart, one set is spent for nothing).
+					std::uint8_t* written = nullptr;
+					const DeviceSize offset = RingAllocate(lightStart + lightBytes, UniformAlignment, written);
+					if (!written) return false;
+					if (offset == 0) {
+						DescriptorSetAllocateInfoData again{ DescriptorSetAllocateInfo, nullptr, Slot().rayDescriptors, 1, &raySetLayout };
+						if (vk.AllocateDescriptorSets(device, &again, &set) != Success) return false;
+					}
+					std::memcpy(written, scene.nodes, static_cast<std::size_t>(nodeBytes));
+					std::memcpy(written + triangleStart, scene.triangles, static_cast<std::size_t>(scene.triangleCount) * sizeof(RayTriangle));
+					std::memset(written + lightStart, 0, static_cast<std::size_t>(lightBytes));
+					if (scene.lightCount > 0) std::memcpy(written + lightStart, scene.lights, static_cast<std::size_t>(scene.lightCount) * sizeof(RayLight));
+					FrameSlot& frame = Slot();
+					const DescriptorBufferInfo buffers[RayBindings] = {
+						{ frame.ring.buffer, offset, nodeBytes },
+						{ frame.ring.buffer, offset + triangleStart, triangleBytes },
+						{ rayRaw.buffer, 0, rayRaw.size },
+						{ rayResult.buffer, 0, rayResult.size },
+						{ frame.ring.buffer, offset + lightStart, lightBytes },
+						{},
+						{ rayReflections.buffer, 0, rayReflections.size },
+						{ rayBounceRaw.buffer, 0, rayBounceRaw.size },
+						{ rayBounce.buffer, 0, rayBounce.size },
+					};
+					const DescriptorImageInfo frameImage{ raySampler, frameColor.view, LayoutShaderReadOnly };
+					WriteDescriptorSetData writes[RayBindings]{};
+					for (std::uint32_t binding = 0; binding < RayBindings; ++binding) {
+						if (binding == RayFrameBinding) writes[binding] = { WriteDescriptorSet, nullptr, set, binding, 0, 1, DescriptorCombinedImageSampler, &frameImage, nullptr, nullptr };
+						else writes[binding] = { WriteDescriptorSet, nullptr, set, binding, 0, 1, DescriptorStorageBuffer, nullptr, &buffers[binding], nullptr };
+					}
+					vk.UpdateDescriptorSets(device, RayBindings, writes, 0, nullptr);
+
+					// The frame is read for reflections: all its draws resolved into frameColor (MSAA), which is lent to the
+					// compute pass as a picture and given back after.
+					Resolve();
+					CommandBuffer commands = Commands();
+					EndPass();
+					Barrier(commands, frameColor.image, AspectColor, LayoutColorAttachment, LayoutShaderReadOnly, AccessColorAttachmentWrite, AccessShaderRead,
+						StageColorAttachmentOutput, StageComputeShader);
+					// The last trace's copy and blur are done with these buffers before they are written again.
+					MemoryBarrierData before{ MemoryBarrier, nullptr, AccessShaderRead | AccessShaderWrite | AccessTransferRead, AccessShaderWrite };
+					vk.CmdPipelineBarrier(commands, StageComputeShader | StageTransfer, StageComputeShader, 0, 1, &before, 0, nullptr, 0, nullptr);
+					const std::uint32_t groupsX = (settings.width + 7) / 8;
+					const std::uint32_t groupsY = (settings.height + 7) / 8;
+					vk.CmdBindPipeline(commands, BindPointCompute, rayPipelines[0]);
+					vk.CmdBindDescriptorSets(commands, BindPointCompute, rayLayout, 0, 1, &set, 0, nullptr);
+					vk.CmdPushConstants(commands, rayLayout, ShaderCompute, 0, sizeof(RayTraceSettings), &settings);
+					vk.CmdDispatch(commands, groupsX, groupsY, 1);
+					MemoryBarrierData traced{ MemoryBarrier, nullptr, AccessShaderWrite, AccessShaderRead };
+					vk.CmdPipelineBarrier(commands, StageComputeShader, StageComputeShader, 0, 1, &traced, 0, nullptr, 0, nullptr);
+					vk.CmdBindPipeline(commands, BindPointCompute, rayPipelines[1]);
+					vk.CmdDispatch(commands, groupsX, groupsY, 1);
+					MemoryBarrierData blurred{ MemoryBarrier, nullptr, AccessShaderWrite, AccessTransferRead };
+					vk.CmdPipelineBarrier(commands, StageComputeShader, StageTransfer, 0, 1, &blurred, 0, nullptr, 0, nullptr);
+					Barrier(commands, frameColor.image, AspectColor, LayoutShaderReadOnly, LayoutColorAttachment, AccessShaderRead, AccessColorAttachmentWrite,
+						StageComputeShader, StageColorAttachmentOutput);
+					Barrier(commands, image.image, AspectColor, LayoutShaderReadOnly, LayoutTransferDst, AccessShaderRead, AccessTransferWrite, StageFragmentShader, StageTransfer);
+					CopyIn(commands, rayResult.buffer, 0, image);
+					Barrier(commands, image.image, AspectColor, LayoutTransferDst, LayoutShaderReadOnly, AccessTransferWrite, AccessShaderRead, StageTransfer, StageFragmentShader);
+					for (const auto& [from, into] : { std::pair{ rayReflections.buffer, reflectionImage }, std::pair{ rayBounce.buffer, bounceImage } }) {
+						if (!into.image) continue;
+						Barrier(commands, into.image, AspectColor, LayoutShaderReadOnly, LayoutTransferDst, AccessShaderRead, AccessTransferWrite, StageFragmentShader, StageTransfer);
+						CopyIn(commands, from, 0, into);
+						Barrier(commands, into.image, AspectColor, LayoutTransferDst, LayoutShaderReadOnly, AccessTransferWrite, AccessShaderRead, StageTransfer, StageFragmentShader);
+					}
+					return true;
+				}
+
 				void UploadScreen(const void* pixels, std::uint32_t width, std::uint32_t height, std::uint32_t pitch) override {
 					if (!screen.image || screen.width != width || screen.height != height) {
 						FlushAndWait();
@@ -425,6 +559,7 @@ namespace KeeperForge2::Render {
 					ImageView view = 0;
 					std::uint32_t width = 0;
 					std::uint32_t height = 0;
+					std::uint32_t levels = 1;
 				};
 				struct BufferResource {
 					Buffer buffer = 0;
@@ -441,6 +576,8 @@ namespace KeeperForge2::Render {
 					DeviceSize ringUsed = 0;
 					DescriptorPool descriptors = 0;
 					std::uint32_t setsUsed = 0;
+					// The ray tracer's sets (made with the tracer, reset with the frame).
+					DescriptorPool rayDescriptors = 0;
 					bool submitted = false;
 					bool recording = false;
 					std::vector<ImageResource> doomed;
@@ -472,6 +609,8 @@ namespace KeeperForge2::Render {
 				ShaderModule fragmentModule = 0;
 				std::unordered_map<std::uint32_t, Pipeline> pipelines;
 				Sampler samplers[SamplerKinds]{};
+				// samplerAnisotropy was turned on for the device (texture_filtering).
+				bool anisotropyEnabled = false;
 				ImageResource frameColor;
 				ImageResource frameDepth;
 				ImageResource screen;
@@ -485,6 +624,153 @@ namespace KeeperForge2::Render {
 				std::unordered_map<std::uint32_t, ImageResource> textures;
 				std::uint32_t nextTexture = 1;
 				std::uint32_t whiteTexture = 0;
+
+				// ---- The ray tracer: its layout, the two compute pipelines (trace, blur), and its buffers on the card (the
+				// trace's per-pixel result and depth, and the blurred pixels copied into the texture), made for one size.
+				bool rayReady = false;
+				bool rayFailed = false;
+				DescriptorSetLayout raySetLayout = 0;
+				PipelineLayout rayLayout = 0;
+				ShaderModule rayModules[2]{};
+				Pipeline rayPipelines[2]{};
+				struct DeviceBuffer {
+					Buffer buffer = 0;
+					DeviceMemory memory = 0;
+					DeviceSize size = 0;
+				};
+				DeviceBuffer rayRaw;
+				DeviceBuffer rayResult;
+				DeviceBuffer rayReflections;
+				DeviceBuffer rayBounceRaw;
+				DeviceBuffer rayBounce;
+				Sampler raySampler = 0;
+				std::uint32_t rayWidth = 0;
+				std::uint32_t rayHeight = 0;
+				bool MakeRayObjects() {
+					if (!LoadDevice(vk.CreateComputePipelines, "vkCreateComputePipelines") || !LoadDevice(vk.CmdDispatch, "vkCmdDispatch")) {
+						Logger::Warning("Ray tracing: Vulkan has no compute entry points here; ray tracing is off.");
+						return false;
+					}
+					DescriptorSetLayoutBinding bindings[RayBindings]{};
+					for (std::uint32_t binding = 0; binding < RayBindings; ++binding) {
+						bindings[binding] = { binding, binding == RayFrameBinding ? DescriptorCombinedImageSampler : DescriptorStorageBuffer, 1, ShaderCompute, nullptr };
+					}
+					// Linear, clamped: the frame read where reflections land.
+					SamplerCreateInfoData samplerInfo{ SamplerCreateInfo, nullptr, 0, 1, 1, 0, 2, 2, 2, 0.0f, 0, 1.0f, 0, 0, 0.0f, 0.0f, 0, 0 };
+					if (vk.CreateSampler(device, &samplerInfo, nullptr, &raySampler) != Success) {
+						Logger::Warning("Ray tracing: Vulkan could not make the tracer's sampler; ray tracing is off.");
+						return false;
+					}
+					DescriptorSetLayoutCreateInfoData layoutInfo{ DescriptorSetLayoutCreateInfo, nullptr, 0, RayBindings, bindings };
+					const PushConstantRange constants{ ShaderCompute, 0, sizeof(RayTraceSettings) };
+					PipelineLayoutCreateInfoData pipelineLayoutInfo{ PipelineLayoutCreateInfo, nullptr, 0, 1, &raySetLayout, 1, &constants };
+					if (vk.CreateDescriptorSetLayout(device, &layoutInfo, nullptr, &raySetLayout) != Success
+						|| vk.CreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &rayLayout) != Success) {
+						Logger::Warning("Ray tracing: Vulkan could not make the tracer's layout; ray tracing is off.");
+						return false;
+					}
+					const struct { const std::uint32_t* words; std::size_t size; } code[2] = {
+						{ VulkanShaders::RayAoCompute, sizeof(VulkanShaders::RayAoCompute) },
+						{ VulkanShaders::RayBlurCompute, sizeof(VulkanShaders::RayBlurCompute) },
+					};
+					for (int i = 0; i < 2; ++i) {
+						ShaderModuleCreateInfoData moduleInfo{ ShaderModuleCreateInfo, nullptr, 0, code[i].size, code[i].words };
+						if (vk.CreateShaderModule(device, &moduleInfo, nullptr, &rayModules[i]) != Success) {
+							Logger::Warning("Ray tracing: Vulkan could not load the tracer's shaders; ray tracing is off.");
+							return false;
+						}
+						ComputePipelineCreateInfoData pipelineInfo{ ComputePipelineCreateInfo, nullptr, 0,
+							{ PipelineShaderStageCreateInfo, nullptr, 0, ShaderCompute, rayModules[i], "main", nullptr }, rayLayout, 0, -1 };
+						if (vk.CreateComputePipelines(device, 0, 1, &pipelineInfo, nullptr, &rayPipelines[i]) != Success) {
+							Logger::Warning("Ray tracing: Vulkan could not make the tracer's pipelines; ray tracing is off.");
+							return false;
+						}
+					}
+					const DescriptorPoolSize sizes[2] = { { DescriptorStorageBuffer, (RayBindings - 1) * RaySetsPerFrame }, { DescriptorCombinedImageSampler, RaySetsPerFrame } };
+					for (FrameSlot& slot : slots) {
+						DescriptorPoolCreateInfoData poolInfo{ DescriptorPoolCreateInfo, nullptr, 0, RaySetsPerFrame, 2, sizes };
+						if (vk.CreateDescriptorPool(device, &poolInfo, nullptr, &slot.rayDescriptors) != Success) {
+							Logger::Warning("Ray tracing: Vulkan could not make the tracer's descriptor pools; ray tracing is off.");
+							return false;
+						}
+					}
+					rayReady = true;
+					Logger::Info("Ray tracing: Vulkan's tracer is ready (compute shaders).");
+					return true;
+				}
+				bool MakeDeviceBuffer(DeviceBuffer& out, DeviceSize size, Flags usage) {
+					BufferCreateInfoData info{ BufferCreateInfo, nullptr, 0, size, usage, 0, 0, nullptr };
+					if (vk.CreateBuffer(device, &info, nullptr, &out.buffer) != Success) return false;
+					MemoryRequirements requirements{};
+					vk.GetBufferMemoryRequirements(device, out.buffer, &requirements);
+					const std::uint32_t type = FindMemory(requirements.memoryTypeBits, MemoryDeviceLocal, 0);
+					MemoryAllocateInfoData allocate{ MemoryAllocateInfo, nullptr, requirements.size, type };
+					if (type == ~0u || vk.AllocateMemory(device, &allocate, nullptr, &out.memory) != Success) {
+						DestroyDeviceBuffer(out);
+						return false;
+					}
+					vk.BindBufferMemory(device, out.buffer, out.memory, 0);
+					out.size = size;
+					return true;
+				}
+				void DestroyDeviceBuffer(DeviceBuffer& buffer) {
+					if (buffer.buffer) vk.DestroyBuffer(device, buffer.buffer, nullptr);
+					if (buffer.memory) vk.FreeMemory(device, buffer.memory, nullptr);
+					buffer = {};
+				}
+				bool MakeRayBuffers(std::uint32_t width, std::uint32_t height) {
+					if (width == rayWidth && height == rayHeight && rayRaw.buffer && rayResult.buffer && rayReflections.buffer && rayBounceRaw.buffer && rayBounce.buffer) return true;
+					// The old ones may still be in use by frames in flight.
+					FlushAndWait();
+					vk.DeviceWaitIdle(device);
+					DestroyDeviceBuffer(rayRaw);
+					DestroyDeviceBuffer(rayResult);
+					DestroyDeviceBuffer(rayReflections);
+					DestroyDeviceBuffer(rayBounceRaw);
+					DestroyDeviceBuffer(rayBounce);
+					rayWidth = rayHeight = 0;
+					const DeviceSize pixels = static_cast<DeviceSize>(width) * height;
+					if (!MakeDeviceBuffer(rayRaw, pixels * 8, BufferUsageStorage) || !MakeDeviceBuffer(rayResult, pixels * 4, BufferUsageStorage | BufferUsageTransferSrc)
+						|| !MakeDeviceBuffer(rayReflections, pixels * 4, BufferUsageStorage | BufferUsageTransferSrc)
+						|| !MakeDeviceBuffer(rayBounceRaw, pixels * 16, BufferUsageStorage) || !MakeDeviceBuffer(rayBounce, pixels * 4, BufferUsageStorage | BufferUsageTransferSrc)) {
+						Logger::Warning("Ray tracing: Vulkan could not make the tracer's buffers for " + std::to_string(width) + "x" + std::to_string(height) + ".");
+						DestroyDeviceBuffer(rayRaw);
+						DestroyDeviceBuffer(rayResult);
+						DestroyDeviceBuffer(rayReflections);
+						DestroyDeviceBuffer(rayBounceRaw);
+						DestroyDeviceBuffer(rayBounce);
+						return false;
+					}
+					rayWidth = width;
+					rayHeight = height;
+					return true;
+				}
+				void DestroyRayObjects() {
+					DestroyDeviceBuffer(rayRaw);
+					DestroyDeviceBuffer(rayResult);
+					DestroyDeviceBuffer(rayReflections);
+					DestroyDeviceBuffer(rayBounceRaw);
+					DestroyDeviceBuffer(rayBounce);
+					if (raySampler) vk.DestroySampler(device, raySampler, nullptr);
+					raySampler = 0;
+					for (Pipeline& pipeline : rayPipelines) {
+						if (pipeline) vk.DestroyPipeline(device, pipeline, nullptr);
+						pipeline = 0;
+					}
+					for (ShaderModule& module : rayModules) {
+						if (module) vk.DestroyShaderModule(device, module, nullptr);
+						module = 0;
+					}
+					if (rayLayout) vk.DestroyPipelineLayout(device, rayLayout, nullptr);
+					if (raySetLayout) vk.DestroyDescriptorSetLayout(device, raySetLayout, nullptr);
+					rayLayout = 0;
+					raySetLayout = 0;
+					for (FrameSlot& slot : slots) {
+						if (slot.rayDescriptors) vk.DestroyDescriptorPool(device, slot.rayDescriptors, nullptr);
+						slot.rayDescriptors = 0;
+					}
+					rayReady = false;
+				}
 
 				// ---- Anti-aliasing (see AntiAliasing in Backend.h).
 				// MSAA: samples per pixel (1 = off), the multisampled color the draws go into, and whether it holds
@@ -802,6 +1088,7 @@ namespace KeeperForge2::Render {
 				bool LoadInstanceFunctions() {
 					return LoadInstance(vk.DestroyInstance, "vkDestroyInstance") && LoadInstance(vk.EnumeratePhysicalDevices, "vkEnumeratePhysicalDevices")
 						&& LoadInstance(vk.GetPhysicalDeviceProperties, "vkGetPhysicalDeviceProperties")
+						&& LoadInstance(vk.GetPhysicalDeviceFeatures, "vkGetPhysicalDeviceFeatures")
 						&& LoadInstance(vk.GetPhysicalDeviceQueueFamilyProperties, "vkGetPhysicalDeviceQueueFamilyProperties")
 						&& LoadInstance(vk.GetPhysicalDeviceMemoryProperties, "vkGetPhysicalDeviceMemoryProperties")
 						&& LoadInstance(vk.GetPhysicalDeviceFormatProperties, "vkGetPhysicalDeviceFormatProperties")
@@ -885,7 +1172,53 @@ namespace KeeperForge2::Render {
 					}
 					if (!physical) return Fail("found no GPU that can show on the game's window");
 					Logger::Info("Renderer: Vulkan uses " + deviceName + ".");
+					if (StringUtils::ToLower(Config::GetString("ray_tracing", "off")) == "on") ProbeRayTracing();
 					return true;
+				}
+				// ray_tracing: on (first step): whether this 32-bit process gets the card's ray tracing through Vulkan. Only reads
+				// and logs; nothing is turned on.
+				void ProbeRayTracing() {
+					// VkPhysicalDeviceProperties: apiVersion at +0, driverVersion at +4. VkExtensionProperties: a 256-character name,
+					// then the spec version.
+					alignas(8) std::uint8_t properties[2048]{};
+					vk.GetPhysicalDeviceProperties(physical, properties);
+					std::uint32_t apiVersion = 0;
+					std::memcpy(&apiVersion, properties, 4);
+					using EnumerateExtensionsFn = std::int32_t(__stdcall*)(PhysicalDevice, const char*, std::uint32_t*, void*);
+					const auto enumerate = reinterpret_cast<EnumerateExtensionsFn>(getInstanceProc(instance, "vkEnumerateDeviceExtensionProperties"));
+					if (enumerate == nullptr) {
+						Logger::Warning("Ray tracing: Vulkan's loader has no vkEnumerateDeviceExtensionProperties; cannot check.");
+						return;
+					}
+					constexpr std::size_t ExtensionSize = 260;
+					std::uint32_t count = 0;
+					enumerate(physical, nullptr, &count, nullptr);
+					std::vector<std::uint8_t> extensions(static_cast<std::size_t>(count) * ExtensionSize);
+					if (count == 0 || enumerate(physical, nullptr, &count, extensions.data()) != Success) {
+						Logger::Warning("Ray tracing: could not list the Vulkan device's extensions.");
+						return;
+					}
+					const auto has = [&](const char* name) {
+						for (std::uint32_t i = 0; i < count; ++i) {
+							if (std::strncmp(reinterpret_cast<const char*>(extensions.data() + i * ExtensionSize), name, 256) == 0) return true;
+						}
+						return false;
+					};
+					const char* wanted[] = { "VK_KHR_acceleration_structure", "VK_KHR_ray_query", "VK_KHR_ray_tracing_pipeline",
+						"VK_KHR_deferred_host_operations", "VK_KHR_buffer_device_address", "VK_KHR_spirv_1_4", "VK_EXT_descriptor_indexing" };
+					std::string found;
+					std::string missing;
+					for (const char* name : wanted) {
+						auto& list = has(name) ? found : missing;
+						if (!list.empty()) list += ", ";
+						list += name;
+					}
+					const bool usable = has("VK_KHR_acceleration_structure") && has("VK_KHR_ray_query") && has("VK_KHR_deferred_host_operations");
+					Logger::Info("Ray tracing: Vulkan " + std::to_string(apiVersion >> 22) + "." + std::to_string((apiVersion >> 12) & 0x3FF) + " on " + deviceName
+						+ " (32-bit process), " + std::to_string(count) + " device extensions. Has: " + (found.empty() ? "none" : found) + ". Missing: "
+						+ (missing.empty() ? "none" : missing) + ".");
+					Logger::Info(std::string("Ray tracing: ") + (usable ? "this card can ray trace for KeeperForge2 through Vulkan (ray queries)."
+						: "this card or driver does not offer ray queries to this 32-bit game through Vulkan."));
 				}
 				std::string deviceName;
 				void PickDepthFormat() {
@@ -911,8 +1244,10 @@ namespace KeeperForge2::Render {
 					}
 					return ~0u;
 				}
-				bool MakeImage(ImageResource& out, std::uint32_t width, std::uint32_t height, Format format, Flags usage, Flags aspect, std::uint32_t samples = 1) {
-					ImageCreateInfoData info{ ImageCreateInfo, nullptr, 0, 1, format, { width, height, 1 }, 1, 1, samples, 0, usage, 0, 0, nullptr, LayoutUndefined };
+				bool MakeImage(ImageResource& out, std::uint32_t width, std::uint32_t height, Format format, Flags usage, Flags aspect, std::uint32_t samples = 1,
+					std::uint32_t levels = 1) {
+					if (levels < 1) levels = 1;
+					ImageCreateInfoData info{ ImageCreateInfo, nullptr, 0, 1, format, { width, height, 1 }, levels, 1, samples, 0, usage, 0, 0, nullptr, LayoutUndefined };
 					if (vk.CreateImage(device, &info, nullptr, &out.image) != Success) return false;
 					MemoryRequirements requirements{};
 					vk.GetImageMemoryRequirements(device, out.image, &requirements);
@@ -923,13 +1258,14 @@ namespace KeeperForge2::Render {
 						return false;
 					}
 					vk.BindImageMemory(device, out.image, out.memory, 0);
-					ImageViewCreateInfoData view{ ImageViewCreateInfo, nullptr, 0, out.image, 1, format, { 0, 0, 0, 0 }, { aspect, 0, 1, 0, 1 } };
+					ImageViewCreateInfoData view{ ImageViewCreateInfo, nullptr, 0, out.image, 1, format, { 0, 0, 0, 0 }, { aspect, 0, levels, 0, 1 } };
 					if (vk.CreateImageView(device, &view, nullptr, &out.view) != Success) {
 						DestroyImage(out);
 						return false;
 					}
 					out.width = width;
 					out.height = height;
+					out.levels = levels;
 					return true;
 				}
 				void DestroyImage(ImageResource& image) {
@@ -1008,7 +1344,7 @@ namespace KeeperForge2::Render {
 						if (vk.CreateFence(device, &fenceInfo, nullptr, &frame.fence) != Success || vk.CreateSemaphoreObject(device, &semaphoreInfo, nullptr, &frame.imageReady) != Success) {
 							return Fail("could not make its sync objects");
 						}
-						if (!MakeBuffer(frame.ring, RingSize, BufferUsageVertex | BufferUsageIndex | BufferUsageUniform | BufferUsageTransferSrc, MemoryHostVisible | MemoryHostCoherent, 0)) {
+						if (!MakeBuffer(frame.ring, RingSize, BufferUsageVertex | BufferUsageIndex | BufferUsageUniform | BufferUsageStorage | BufferUsageTransferSrc, MemoryHostVisible | MemoryHostCoherent, 0)) {
 							return Fail("could not make its upload buffers");
 						}
 						const DescriptorPoolSize sizes[] = { { DescriptorUniformBuffer, SetsPerFrame }, { DescriptorCombinedImageSampler, SetsPerFrame * 3 } };
@@ -1096,6 +1432,7 @@ namespace KeeperForge2::Render {
 					frame.ringUsed = 0;
 					frame.setsUsed = 0;
 					vk.ResetDescriptorPool(device, frame.descriptors, 0);
+					if (frame.rayDescriptors) vk.ResetDescriptorPool(device, frame.rayDescriptors, 0);
 					vk.ResetCommandBuffer(frame.commands, 0);
 					CommandBufferBeginInfoData begin{ CommandBufferBeginInfo, nullptr, 1, nullptr };
 					vk.BeginCommandBuffer(frame.commands, &begin);
@@ -1146,7 +1483,7 @@ namespace KeeperForge2::Render {
 						if (size > frame->ring.size) {
 							vk.DeviceWaitIdle(device);
 							DestroyBuffer(frame->ring);
-							if (!MakeBuffer(frame->ring, AlignUp(size, RingSize), BufferUsageVertex | BufferUsageIndex | BufferUsageUniform | BufferUsageTransferSrc, MemoryHostVisible | MemoryHostCoherent, 0)) {
+							if (!MakeBuffer(frame->ring, AlignUp(size, RingSize), BufferUsageVertex | BufferUsageIndex | BufferUsageUniform | BufferUsageStorage | BufferUsageTransferSrc, MemoryHostVisible | MemoryHostCoherent, 0)) {
 								Fail("ran out of upload memory");
 								return 0;
 							}
@@ -1159,12 +1496,14 @@ namespace KeeperForge2::Render {
 					written = static_cast<std::uint8_t*>(frame->ring.mapped) + offset;
 					return offset;
 				}
-				void CopyIn(CommandBuffer commands, Buffer from, DeviceSize offset, const ImageResource& image) {
-					BufferImageCopy region{ offset, 0, 0, { AspectColor, 0, 0, 1 }, { 0, 0, 0 }, { image.width, image.height, 1 } };
+				void CopyIn(CommandBuffer commands, Buffer from, DeviceSize offset, const ImageResource& image, std::uint32_t level = 0) {
+					BufferImageCopy region{ offset, 0, 0, { AspectColor, level, 0, 1 }, { 0, 0, 0 }, { MipLevelSize(image.width, level), MipLevelSize(image.height, level), 1 } };
 					vk.CmdCopyBufferToImage(commands, from, image.image, LayoutTransferDst, 1, &region);
 				}
 				void Barrier(CommandBuffer commands, Image image, Flags aspect, ImageLayout from, ImageLayout to, Flags sourceAccess, Flags targetAccess, Flags sourceStage, Flags targetStage) {
-					ImageMemoryBarrierData barrier{ ImageMemoryBarrier, nullptr, sourceAccess, targetAccess, from, to, QueueFamilyIgnored, QueueFamilyIgnored, image, { aspect, 0, 1, 0, 1 } };
+					// Every mip level (VK_REMAINING_MIP_LEVELS): textures with mips are moved as a whole, the others have one.
+					ImageMemoryBarrierData barrier{ ImageMemoryBarrier, nullptr, sourceAccess, targetAccess, from, to, QueueFamilyIgnored, QueueFamilyIgnored, image,
+						{ aspect, 0, RemainingMipLevels, 0, 1 } };
 					vk.CmdPipelineBarrier(commands, sourceStage, targetStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 				}
 
@@ -1238,8 +1577,12 @@ namespace KeeperForge2::Render {
 					if (!made) {
 						// VkSamplerAddressMode is D3DTEXTUREADDRESS minus one.
 						const std::int32_t filter = state.linear ? 1 : 0;
-						SamplerCreateInfoData info{ SamplerCreateInfo, nullptr, 0, filter, filter, 0, static_cast<std::int32_t>(state.addressU) - 1,
-							static_cast<std::int32_t>(state.addressV) - 1, 2, 0.0f, 0, 1.0f, 0, 0, 0.0f, 0.0f, 0, 0 };
+						// Mip levels are used (mipmap mode as the filter, no upper limit on the level: VK_LOD_CLAMP_NONE), and
+						// texture_filtering's anisotropy for the linear ones when the device has it.
+						const bool anisotropic = state.linear && anisotropy > 1 && anisotropyEnabled;
+						SamplerCreateInfoData info{ SamplerCreateInfo, nullptr, 0, filter, filter, filter, static_cast<std::int32_t>(state.addressU) - 1,
+							static_cast<std::int32_t>(state.addressV) - 1, 2, 0.0f, anisotropic ? 1u : 0u, anisotropic ? static_cast<float>(anisotropy) : 1.0f, 0, 0,
+							0.0f, LodClampNone, 0, 0 };
 						vk.CreateSampler(device, &info, nullptr, &made);
 					}
 					return made;
@@ -1248,6 +1591,7 @@ namespace KeeperForge2::Render {
 				void Shutdown() {
 					if (device) {
 						vk.DeviceWaitIdle(device);
+						DestroyRayObjects();
 						for (auto& [handle, texture] : textures) DestroyImage(texture);
 						textures.clear();
 						for (FrameSlot& frame : slots) {

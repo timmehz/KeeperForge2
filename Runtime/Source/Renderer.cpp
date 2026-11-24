@@ -7,6 +7,7 @@
 #include "Memory.h"
 #include "StringUtils.h"
 #include <Windows.h>
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
@@ -303,10 +304,62 @@ namespace KeeperForge2 {
 			Config::SetString("anti_aliasing", Render::AntiAliasingConfigName(*antiAliasing));
 		}
 		Render::Layer::SetAntiAliasing(*antiAliasing);
+		// texture_filtering: off (the game's own: no mip levels), trilinear (mip levels), or anisotropic x2 to x16 (mip
+		// levels and anisotropic sampling).
+		auto filteringWord = StringUtils::ToLower(Config::GetString("texture_filtering", "anisotropic x16"));
+		std::uint32_t anisotropy = 0;
+		if (filteringWord == "trilinear") anisotropy = 1;
+		else if (filteringWord.starts_with("anisotropic x")) {
+			const auto times = filteringWord.substr(13);
+			if (times == "2" || times == "4" || times == "8" || times == "16") anisotropy = static_cast<std::uint32_t>(std::stoul(times));
+		}
+		if (anisotropy == 0 && filteringWord != "off") {
+			Logger::Warning("Renderer: \"" + filteringWord + "\" in config.yml is not off, trilinear or anisotropic x2, x4, x8 or x16; using anisotropic x16 and writing that to config.yml.");
+			Config::SetString("texture_filtering", "anisotropic x16");
+			filteringWord = "anisotropic x16";
+			anisotropy = 16;
+		}
+		Render::Layer::SetTextureFiltering(anisotropy != 0, anisotropy == 0 ? 1 : anisotropy);
+		// model_smoothing: off, low, medium or high (each curved edge of the 3D world cut into 2, 3 or 4).
+		auto smoothingWord = StringUtils::ToLower(Config::GetString("model_smoothing", "medium"));
+		if (smoothingWord != "off" && smoothingWord != "low" && smoothingWord != "medium" && smoothingWord != "high") {
+			Logger::Warning("Renderer: model_smoothing \"" + smoothingWord + "\" in config.yml is not off, low, medium or high; using medium and writing that to config.yml.");
+			Config::SetString("model_smoothing", "medium");
+			smoothingWord = "medium";
+		}
+		const std::uint32_t smoothingSegments = smoothingWord == "low" ? 2 : smoothingWord == "medium" ? 3 : smoothingWord == "high" ? 4 : 0;
+		Render::Layer::SetModelSmoothing(smoothingSegments);
+		if (smoothingSegments != 0) Logger::Info("Renderer: model smoothing " + smoothingWord + " (curved edges cut into " + std::to_string(smoothingSegments) + ").");
+		Logger::Info("Renderer: texture filtering " + filteringWord + (anisotropy != 0 ? " (mip levels made by KeeperForge2)." : " (the game's own)."));
 		const auto gpuBlitsWord = StringUtils::ToLower(Config::GetString("gpu_blits", "on"));
 		const bool gpuBlits = gpuBlitsWord != "off" && gpuBlitsWord != "clears";
 		const bool gpuClears = gpuBlitsWord != "off";
 		Render::Layer::SetGpuBlits(gpuBlits, gpuClears);
+		const bool rayTracing = StringUtils::ToLower(Config::GetString("ray_tracing", "off")) == "on";
+		const bool rayOcclusion = StringUtils::ToLower(Config::GetString("ray_tracing_occlusion", "on")) == "on";
+		const bool rayShadows = StringUtils::ToLower(Config::GetString("ray_tracing_shadows", "on")) == "on";
+		const bool rayReflections = StringUtils::ToLower(Config::GetString("ray_tracing_reflections", "on")) == "on";
+		const bool rayBounce = StringUtils::ToLower(Config::GetString("ray_tracing_bounce", "on")) == "on";
+		const auto rayQuality = StringUtils::ToLower(Config::GetString("ray_tracing_quality", "medium"));
+		const std::uint32_t rayDivisor = rayQuality == "high" ? 2 : rayQuality == "low" ? 4 : 3;
+		// Traces a second (0: every frame).
+		std::uint32_t rayRate = 30;
+		{
+			const auto rateWord = StringUtils::ToLower(Config::GetString("ray_tracing_rate", "30"));
+			if (rateWord == "0") rayRate = 0;
+			else {
+				try { rayRate = static_cast<std::uint32_t>(std::stoul(rateWord)); }
+				catch (...) { rayRate = 30; }
+				rayRate = std::clamp<std::uint32_t>(rayRate, 5, 240);
+			}
+		}
+		Render::Layer::SetRayTracing(rayTracing, rayOcclusion, rayShadows, rayReflections, rayBounce, rayDivisor, rayRate);
+		if (rayTracing) {
+			Logger::Info(std::string("Renderer: ray_tracing is on (our own compute-shader tracer): ambient occlusion ") + (rayOcclusion ? "on" : "off")
+				+ ", shadows " + (rayShadows ? "on" : "off") + ", reflections " + (rayReflections ? "on" : "off") + ", bounce light " + (rayBounce ? "on" : "off")
+				+ ", quality " + rayQuality
+				+ " (1/" + std::to_string(rayDivisor) + " of the screen), " + (rayRate == 0 ? std::string("traced every frame") : "traced up to " + std::to_string(rayRate) + " times a second") + ".");
+		}
 		if (!gpuClears) Logger::Info("Renderer: gpu_blits is off; the game's blits and clears of the frame are done in memory.");
 		else if (!gpuBlits) Logger::Info("Renderer: gpu_blits is clears; whole-frame clears are done on the graphics card, blits in memory.");
 		if (Memory::Read<std::uintptr_t>(Game::Resolve(Game::Address::GameDirectDraw)) != 0) {
@@ -333,6 +386,8 @@ namespace KeeperForge2 {
 	}
 
 	bool Renderer::IsActive() { return importsPatched && Render::Layer::IsInUse(); }
+
+	bool Renderer::IsChosen() { return importsPatched; }
 
 	void Renderer::SetStretch(bool stretch) { Render::Layer::SetStretch(stretch); }
 

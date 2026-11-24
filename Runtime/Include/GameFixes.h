@@ -10,5 +10,8 @@ namespace KeeperForge2 {
 			static void Install();
 			// The game's window became the active one again (WM_ACTIVATEAPP): keys held while away are let go.
 			static void OnWindowActivated();
+			// The game's window was asked to close (WM_CLOSE, e.g. Alt+F4). During a game this sends the game's own "exit
+			// to Windows" action and returns true (the message is handled); otherwise false, and the game closes as before.
+			static bool OnWindowClose();
 	};
 }

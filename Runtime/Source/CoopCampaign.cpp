@@ -1,11 +1,13 @@
 #include "CoopCampaign.h"
 #include "CoopHands.h"
+#include "CustomCampaign.h"
 #include "GameAddresses.h"
 #include "HookManager.h"
 #include "LevelEditor.h"
 #include "Logger.h"
 #include "Memory.h"
 #include "ModApiHost.h"
+#include "PossessionActions.h"
 #include "SessionOptions.h"
 #include "SteamMultiplayer.h"
 #include <array>
@@ -83,17 +85,21 @@ namespace KeeperForge2 {
 				PlayMode() = SessionPlayMode();
 			}
 			// A level being edited also keeps what its file says: all its keepers, its own settings, none of the lobby's.
-			return CampaignRules() || LevelEditor::InSession() ? Game::PlayModeCampaign : PlayMode();
+			// A custom campaign's level too (CustomCampaign.cpp).
+			return CampaignRules() || LevelEditor::InSession() || CustomCampaign::InSession() ? Game::PlayModeCampaign : PlayMode();
 		}
 		// Whether one player's win or loss decides the others'. Sharing one keeper there are no others. With parts apart,
 		// the game's multiplayer rule is what ends the level for the machine that did not win.
 		std::int32_t __cdecl OutcomeMode() { return CampaignRules() && EveryoneShares() ? 0 : PlayMode(); }
 		// Winning and losing as in the campaign, the victory cinematic included, while everyone shares one keeper. With
 		// parts apart a win is someone's loss, so that stays multiplayer's.
-		std::int32_t __cdecl EndingMode() { return CampaignRules() && EveryoneShares() ? Game::PlayModeCampaign : PlayMode(); }
+		// A custom campaign's level ends as the campaign's do too: Horny comes for the Portal Gem (0x4BF410). Its secret
+		// unlocks are kept off by CustomCampaign (the level's flags, around PlayerSetStatus).
+		std::int32_t __cdecl EndingMode() { return (CampaignRules() && EveryoneShares()) || CustomCampaign::InSession() ? Game::PlayModeCampaign : PlayMode(); }
 		// The campaign's progress is the host's. A joining player's own stays as it was.
 		bool hostMachine = false;
-		std::int32_t __cdecl ProgressMode() { return hostMachine && !soloSession ? EndingMode() : PlayMode(); }
+		// A custom campaign's level never writes the real campaign's progress.
+		std::int32_t __cdecl ProgressMode() { return hostMachine && !soloSession && !CustomCampaign::InSession() ? EndingMode() : PlayMode(); }
 
 		// In place of "mov eax, [play mode]".
 		__declspec(naked) void ModeIntoEax() {
@@ -270,7 +276,8 @@ namespace KeeperForge2 {
 			const bool noWorld = Memory::Read<std::int32_t>(Game::Resolve(Game::Address::GameConfigNoGame)) != 0;
 			const bool playing = !frontEnd && !noWorld;
 			const bool editing = LevelEditor::OnGameComponentStart(playing);
-			if (playing && !editing && choices.level != 0) StartSession();
+			const bool customLevel = !editing && CustomCampaign::OnGameComponentStart(playing);
+			if (playing && !editing && !customLevel && choices.level != 0) StartSession();
 			return GameFunction<EnterScreenFn>(Game::Address::EnterGameScreen)(resources, unused, hardware);
 		}
 
@@ -583,12 +590,14 @@ namespace KeeperForge2 {
 			ModApiHost::BeforeGameTurn();
 			if (LevelEditor::Testing()) {
 				const auto result = originalWorldTick(world, unused, actions);
+				PossessionActions::AfterWorldTick(world);
 				LevelEditor::AfterTestTick(world);
 				return result;
 			}
 			if (PlayMode() == Game::PlayModeMultiplayer) SteamMultiplayer::OnGameTurn();
 			if (!CampaignRules()) {
 				const auto result = originalWorldTick(world, unused, actions);
+				PossessionActions::AfterWorldTick(world);
 				LevelEditor::AfterPlayTick();
 				return result;
 			}
@@ -606,6 +615,7 @@ namespace KeeperForge2 {
 			CoopHands::BeforeWorldTick(world, actions);
 			const auto result = originalWorldTick(world, unused, actions);
 			CoopHands::AfterWorldTick(world);
+			PossessionActions::AfterWorldTick(world);
 			SettleGoodPlayer(world);
 			LevelEditor::AfterPlayTick();
 			return result;

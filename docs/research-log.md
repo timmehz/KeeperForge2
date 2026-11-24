@@ -1403,3 +1403,317 @@
   applied was not found. Not built or tested.
 - 2026-11-18: middle click camera reset built and works in-game. Still open: whether loading a saved game counts as a
   level start for it.
+- 2026-11-18: Flame port list (flame-port.md). Went through all of Flame's patch switches and options. New items not
+  in game-fixes.md: a null room check in the bridge tile draw, autosave, custom campaign, zoom range, mouse from
+  Windows messages, settings out of the registry, incompatible session reasons, start-up errors, Windows version check.
+  Most of Flame's fixes are inside rebuilt game functions; we port them as hooks instead.
+- 2026-11-18: hero party spawn at the creature limit (first Flame port). 0x519F90 returned 0 mid-party when a member
+  could not be made; its finish code (0x51A5E2) uses the leader twice without a null check (an effect at its position,
+  and its place in the party). Fixed with three stubs. Flame guards only the second use. Not built or tested.
+- 2026-11-18: missing picture. 0x59A4B0 (load PNG) has one caller, 0x5912D3, which reads the size at once and copies the
+  pixels (0x5914E0, whose closing call 0x401200 is an empty function), so the record is never freed there and one shared
+  placeholder is safe. Hooked; not built or tested.
+- 2026-11-18: room tile with no room. 0x443610 (room tile meshes, called at 0x43E3E0) reads the tile's room through
+  0x4559B0 (ThingTable[(tile + 2) & 0xFFF]) with no null check. Hooked; may be where the room limit's roomless tiles
+  crashed. Not built or tested.
+- 2026-11-18: long save path. Loading a save builds saves folder + name with "%s%s" into a 64-byte stack buffer
+  (0x5255A7); the folder is the game folder + data\Save\ (59 characters for a default Steam install), so it overflowed on
+  normal installs. The whole block (0x52555E..0x5255AF) now jumps to our stub; the loader gets our 1024-byte buffer.
+  Not built or tested.
+- 2026-11-18: sound thread stop wait. The sound list thread's stop (0x60D630) busy-waits on + 0x38 at 0x60D64A. It is
+  a possible hang on exit rather than a crash. Now yields (SwitchToThread) each pass. Not built or tested.
+- 2026-11-18: closing the window during a game. The game's window procedure (0x5B5070) sets the quit flag on WM_CLOSE.
+  Action kind 0x7D = exit to Windows, confirmed in the in-game confirmation 0x4205B0 (raw bytes, decoded by hand),
+  sent through the interface push 0x4346E0. Dead end: the world's action table entry for 0x7D (0x6A5508, handler
+  0x512940) only passes the action on (0x510F90), so the table alone does not show what 0x7D does. Not built or tested.
+- 2026-11-18: host port box. Text input limit (+ 0x280, from config + 0x1A in 0x52AA10) counts the closing 0: typing
+  (0x52C40E) takes a character only while length < limit - 1. Port box id 0x212 has limit 5. Hooked 0x52AA10 to add one
+  for that box. Not built or tested.
+- 2026-11-18: why a game cannot be joined. The session list 0x54D370 and the map lookup 0x53ED60 are raw bytes in our
+  export; disassembled by putting the bytes into a scratch .asm (db lines), assembling with ml.exe and running dumpbin
+  /disasm (call targets then read relative to 0: add the function's address). The game ignores the map lookup's result
+  when deciding who can join; Flame counts a missing map. Two stubs added. Not built or tested; how the list draws the
+  line's fifth field is not checked.
+- 2026-11-18: start-up errors. The game's start-up 0x5A5DA0 is one function (Flame splits it). Seven steps returning 0
+  end it silently; also a second copy (mutex "DKII MUTEX") exits silently. Their call sites now go to wrappers; a message
+  box after the start-up names the failed step or says the game is already running. Note: 0x5A5DA0 returns 1 on most
+  failures, so its result cannot tell. Not built or tested.
+- 2026-11-18: Windows version check. 0x557FB0 passes only when Windows is below 6.0 (GetVersionExA through 0x557FD0).
+  patch.dll reads the version only for its display setting. Changed "push 6" (0x557FB4) to "push 11", as Flame does.
+  Open: what makes the check pass on current installs today (likely a Windows compatibility shim). Not built or tested.
+- 2026-11-18: computer player stuck on one creature. In 0x4FE0B0 the drop pick loop (last test 0x4FE504) and the
+  ownership test after it (0x48E6A0 at 0x4FE544) are separate, so a creature in the keeper's list that is not its own
+  was picked on every pass. Flame keeps a penalty in an extended creature; ours is a table by tag, cleared at level
+  start. Not built or tested.
+- 2026-11-18: first in-game test of groups 1 and 2. The only warning: "start-up errors: unexpected game code". Cause:
+  patch.dll rewrites the command line call (rel32 at 0x5A5FAD) to its own parser, so the call no longer led to
+  0x5A63B0. Now each step only has to be a "call rel32" and its current target is wrapped.
+- 2026-11-18: King in the hand (reported in game). Stock Creatures.kwd: In Hand (animation 11) is empty for King
+  Reginald and the Stone Knight. Filled from their Stunned pose in the record converter 0x568E30. Not built or tested.
+- 2026-11-18: autosave (game/autosave.md). World save 0x50FD10 takes a full path; the in-game save list is a file list
+  at 0x6CE980 (reset 0x54F0D0, fill 0x54F0F0). Counted in game turns, run after each frame is shown. Not built or tested.
+- 2026-11-18: wider zoom. 0x449CA0 (camera zoom by an amount, raw bytes, disassembled with ml + dumpbin) clamps the zoom
+  (+ 0xD80) to + 0xD50 .. + 0xD54 - 1. Hooked: limits widened by Flame's amounts around the call and put back.
+  This also answers part of the 2026-11-17 dead end (where the zoom action is applied). Not built or tested.
+- 2026-11-18: title screen. 0x5340F0 waits 10 s in a clock-only loop (0x5341D8..0x5341F6, clock 0x5B5E90). Replaced by a
+  stub: title_screen_ms (default 600), skipped by Space/Escape/Enter/left click. Not built or tested.
+- 2026-11-18: custom campaigns, phase 1 (CustomCampaign.cpp). Found: the skirmish map list text at [0x740354] (4 fields per
+  map, built by 0x53FEB0, counted by 0x540B20 as 0s / 4), the map list click 0x5416E0 (row at 0x740348), the front end
+  0x70D6D8 with its window at + 0x6016 and chosen map at + 0x6580, menu actions 0x58/0x4E/0x4F/0x5A/0x18 in 0x5306F0.
+  In the map list the tick is 0x4E and the cross 0x4F (0x4F restores + 0x6033). Not built or tested; open: whether
+  the menus return to the skirmish screen after a level.
+- 2026-11-18: custom campaigns, phase 2. The briefing and objective texts come from a per-level briefing table read by
+  0x553AC0 (ids 0-5; loaded by 0x553800 by level text number); the briefing window is window 7 (tick 0x0C, cross
+  0x0A), the in-game Level Objective window 0x4207E0 shows ids 2 then 3-5. Hooked 0x553AC0 for campaign.yml texts;
+  the briefing is opened with changeGui (0x5391F0). Id meanings are from layout, not from reading the texts.
+  Not built or tested.
+- 2026-11-18: custom campaigns, first test: the Custom Campaign button opened the plain skirmish screen and the log
+  said "front end window 0" the whole time. Dead end: + 0x6016 in the front end is not the window shown, only the
+  window the map list was opened from (set to 9 or 32 by the map list actions). The window shown comes from the front
+  end's window list (pointer at + 0x30FCE; id + 0x44, shown + 0x48, next + 0x62), as the game's 0x5322D0 does. Fixed
+  to look windows up by id there. Not tested again yet.
+- 2026-11-18: custom campaigns, second test: the campaign list opened, but backing out left the skirmish screen drawn
+  over the Single Player menu, and the skirmish screen showed before the list. Cause: menu actions switch no windows;
+  the button click (0x528610) hides the button's window (config + 0x12) and shows config + 0xE after the action, so
+  actions run without a button left windows up. Now each step hides and shows windows itself, and the skirmish
+  screen's step (0x538AC0) is hooked so the campaign list or briefing takes its place before a frame is drawn. Also
+  found: the skirmish start sets the menus' return place 0x759B30 to 0x2D, which 0x5384F0 does not send to the
+  skirmish step, so the way back after a level is still unknown. Not tested again yet.
+- 2026-11-18: custom campaigns, third test: the campaign list shows (without the skirmish screen), but with the old
+  map's preview and the "Map Select" title. Found the map list's widget table (0x6B2F48): the preview is widget 687,
+  drawn while front end + 0x30C1E is 1 to 3; titles are pictures made once at front end start (0x536850 through
+  0x536370). Now the list sets + 0x30C1E to 0 and swaps in a "Custom Campaigns" title made the same way. Not tested
+  again yet.
+- 2026-11-18: custom campaigns: the title swap first used title picture 6 (the title widget's button config + 0x44),
+  but the picture's number is the widget's text id field (config + 0x40, here 9; the title table at 0x6B8468 has
+  text 145, Load Game, at 6 and 2800 at 9). Fixed to 9. The column headings are text widgets reading that same field
+  each frame through text by id, so they are renamed by pointing it at our own text ids while the list shows
+  campaigns. Not tested yet.
+- 2026-11-19: custom campaigns, fourth test: the skirmish screen still flashed before the list. Our hook on the
+  skirmish screen's step (0x538AC0) was refused because SkirmishSwapKeeper already hooks the same function (as
+  SkirmishSetup), so the next-frame fallback did the swap. Now SkirmishSwapKeeper's hook calls CustomCampaign. The
+  green size column is part of the list's background picture (0x7401F0); it is cropped by narrowing the picture
+  record's width (+ 0x1C) while the list shows campaigns. Not tested again yet.
+- 2026-11-19: custom campaigns, fifth test: the list now opens with no skirmish screen (SkirmishSwapKeeper's hook
+  calls CustomCampaign). Choosing a campaign brought back a green box (the row highlight picture 0x740218 has one
+  over the size column; now cut to the background's width) and showed "Max Players : 0 / 2" (the details draw
+  0x540600 shows the second field; now hooked and given a list where the chosen row has only its name). Not tested
+  again yet.
+- 2026-11-19: custom campaigns, sixth test: "Max Players :" still showed (without the 0 / 2). The details draw's
+  field walk only reports no field when it stops on 0xFFFF; a 0 then 0xFFFF counts as an empty field. Now the name is
+  followed directly by 0xFFFF (then a 0, where the text conversion stops; 0xFFFF itself converts to a 0 byte). Not
+  tested again yet.
+- 2026-11-19: custom campaigns, seventh test: a level was played, lost, and the menus came back to the campaign list
+  (the skirmish step path works on the way back). The first briefing showed everything, but its Sub Objective box
+  listed text 3 (our briefing) with 4 and 5, so the ids were remapped (2 objective + briefing, 3-5 sub objectives,
+  0 "Level N"). The briefing after the level was the short one (title only text 1, no sub objectives): front end
+  + 0x311B6 / + 0x311BA, flags copied from the last level read (Secret1 is a secret level). Now cleared when our
+  briefing opens. Not tested again yet.
+- 2026-11-19: custom campaigns: briefing picture. The game's briefing window has no picture (its left third is
+  empty; the 0x73FF10 flags are only the text boxes' background tiles, BG_Tiles). Added our own widget to window 7's
+  list (config 0x6AEF38) drawing a picture record through 0x52CF90; the file is read with WIC. Test picture made for
+  the Test campaign. Not built or tested yet.
+- 2026-11-19: custom campaigns: levels are now the campaign folder's 1.kwd, 2.kwd, ... (no `levels` line, no levels
+  taken from Data\editor\maps). Only the .kwd is renamed: it lists its .kld files by path, and those reads are sent to
+  the file of the same name in the campaign's folder. Not built or tested yet.
+- 2026-11-19: custom campaigns, after playing the real Level 1 and 2 renamed 1.kwd / 2.kwd: winning level 1 crashed at
+  0x53D682 in the skirmish results screen (its table, front end + 0x3033C, sized by the chosen skirmish map record's
+  players, which our levels are not; 0x53C520 now hooked). Horny did not come for the Portal Gem: the campaign ending
+  (0x4BEDC0, game type 1) was not used; CoopCampaign's EndingMode now says campaign for custom campaigns, with the
+  level's secret-unlock flag bits (0x6F2957 bits 3 and 4) cleared around PlayerSetStatus. The menus now list a
+  campaign's levels to pick from and come back to that list after a level. Not built or tested yet.
+- 2026-11-19: ray tracing, first step. The game's triangles reach the renderer in screen space (x, y, z, rhw, colour,
+  texture coordinates), culled on the CPU, with no world positions, normals or lights; geometry has to be rebuilt in
+  camera space from rhw and the projection. Open question before building: whether drivers offer DXR or Vulkan ray
+  queries to a 32-bit process. Added `ray_tracing` (off) whose `on` only probes and logs this in each backend. Not
+  built or tested yet. Plan in game/ray-tracing.md.
+- 2026-11-19: ray tracing check, Vulkan, NVIDIA RTX A4000: no VK_KHR_acceleration_structure / ray_query /
+  ray_tracing_pipeline / deferred_host_operations for this 32-bit process (it has Vulkan 1.4, buffer device address,
+  spirv 1.4, descriptor indexing). Hardware ray tracing through Vulkan is out from inside the game. DirectX 12 still to
+  check.
+- 2026-11-19: ray tracing: owner chose our own tracer in compute shaders. Stage 1 written: RayScene (camera space
+  from rhw and WidescreenCamera's focal length, binned SAH tree on the CPU), Vulkan compute (ray_ao.comp,
+  ray_blur.comp), laid over the frame at EndScene. Not built or tested; the shaders need compile_vulkan_shaders.ps1.
+- 2026-11-19: ray tracing stage 1 tested: 60 fps at 4K on Vulkan, tree 1.3-3.9 ms. Stage 2 (shadows) written: the
+  engine camera at 0x760AB8.. (position, view-to-world rotation, focal, middle; set by 0x575A00) and the bridge's
+  light list (+ 0x33A, next + 0x13C; position + 0xD6, color + 0x111, reach + 0x117, strength + 0x145). Not built or
+  tested.
+- 2026-11-19: mouse from Windows messages (Flame's replace_mouse_dinput_to_user32), for the slow pointer at 4K (the
+  DirectInput mouse adds raw counts as screen pixels, 0x5DD4A0). The game sets up its mouse (0x557CB0 -> 0x5BC060)
+  before it makes its DirectDraw, so the switch keys off our renderer being chosen, not in use. 0x5BC210 (window
+  activation) writes into the mouse without a check; the other users check. Flame's modifier flags on buttons are
+  overwritten by the control keys object (0x5DD010) and its key switch falls through; dropped. The game's window class
+  has no CS_DBLCLKS, so no double clicks arrive. Flame's relative movement in a creature sets the unread movement where
+  the game clears it on read (0x5DD6A0); ours adds. Added holding the pointer to the window. `windows_mouse` (on),
+  WindowsMouse.cpp, game/mouse.md. Not built or tested yet.
+- 2026-11-19: ray tracing stage 2 tested: engine camera and lights read right (lights on screen where they belong);
+  60 fps fell to 43-51 at 4K. Stage 3 written: ray_tracing_quality (a half, third or quarter of the screen; medium
+  default), no shadow ray for faint lights, and reflections on water and lava (bump-mapped draws as mirror triangles,
+  colors read from the frame where the reflected ray lands). Not built or tested.
+- 2026-11-19: ray tracing stage 4 written: one bounce of light (diffuse rays read the frame where they land, blurred
+  with the lighting, added as frame * (1 + bounce)), setting ray_tracing_bounce. DirectX 12 and 11 wait until the
+  Vulkan effects are tested. Not built or tested.
+- 2026-11-19: ray tracing stage 5 written (owner: everything before testing): the tracer on DirectX 12 and 11, in
+  HLSL (RayHlsl.h) mirroring the GLSL passes; result textures turned into writable RGBA pictures, as neither DirectX
+  copies a buffer into a texture like Vulkan. Not built or tested.
+- 2026-11-19: keeper colors. The player color table at 0x6E5058 (three shades a player number, filled by 0x4C04C0),
+  read by 0x50F830, the lobby and an engine thing's owner tint (0x436338). Not found: a texture recoloring for
+  claimed terrain (texture names carry frame numbers, not colors). KeeperColors writes the table (first frame and
+  each change) with shades made the game's way; ColorPicker is our own wheel window. Not built or tested; whether
+  claimed floors take the table's colors is the open question.
+- 2026-11-20: claimed terrain colors. Tested: the color table alone leaves claimed floors and reinforced walls in the
+  game's colors. They are per-player meshes ("Claimed Floor<d>_<n>", "Claimed Top<d>_<n>", 0x4C2980 / 0x4C2A70, player
+  number d + 1) picked by the tile's owner (0x43E860), so the color is in their textures. The texture cache keeps most
+  textures compressed (0x591070, read by 0x590EC0) and decodes them only when 0x590450 copies them into a cache page,
+  so recoloring at decode time (0x5911E0) would miss most. KeeperColors notes the materials (0x57C850) those meshes use,
+  per player, and recolors a keeper-only texture's pixels after each 0x590450 copy (not into the scaler's work
+  surfaces). The text button became a color box beside each skirmish list row (widget 9002 at layout x 1400). Not
+  built or tested.
+- 2026-11-20: first test of the claimed terrain colors. The first game found the keepers' textures (T_Claimed_Path<k>,
+  T_Claimed_Top<k>). The second found none, because texture numbers change between games and the old notes were kept.
+  The notes are now cleared each game, and the first recolors are logged at debug. The color boxes are now bigger.
+- 2026-11-20: claimed terrain recolor, second test: the colors showed, but the whole claimed tile changed, because
+  red's stone is reddish-brown and passed the hue test. Now the changed pixels are those that differ from another
+  keeper's version of the same texture (loaded through 0x590EC0, copied to the same place to compare, then put
+  back). The hue test is kept, narrower, only for when no other version is found.
+- 2026-11-20: claimed terrain recolor, third version (the user's idea): the keeper's colored parts are rebuilt from
+  the Good player's version of the same texture (white there), tinted with the chosen color, so the result is
+  clean. The parts are still found by comparing the two versions.
+- 2026-11-20: claimed terrain recolor, fourth test. The Good player's textures are T_Claimed_Good (no pair for the keepers'
+  T_Claimed_Path<k>) and T_Claimed_Top0. The tint over its flat white made the wall-top trim flat and too bright. The
+  colored parts are now found against another keeper's version (paths: 142 of 16384 pixels; tops: about 3520). They
+  get the chosen color shaded by the keeper's own pixel brightness relative to its game color.
+- 2026-11-20: claimed terrain recolor, fifth test. Two keepers were right, but the third (purple) had specks of its
+  color over its wall tops: spots where its stone differs a little from the one keeper it was compared with. Now
+  it is compared with every other keeper's version, and each pixel counts by its smallest difference (0.10 to 0.25).
+  The color boxes are bigger again.
+- 2026-11-20: minimap keeper colors. The minimap's colors are its own table, filled from MapColours.png by 0x41E810:
+  three entries per player (+ 0x48, + 0x6C, + 0x90), also handed to its drawer (vtable + 0x294). KeeperColors
+  rewrites the keepers' entries after it, shaded like the game's. Not built or tested.
+- 2026-11-20: minimap keeper colors, first test. Red and blue were swapped (yellow showed cyan, orange blue): the
+  minimap table's entries are 0xFFBBGGRR (red in the low byte), not 0xFFRRGGBB. Fixed.
+- 2026-11-20: no Stone Knight ever came through a Mercenary Portal: the pool held none ("none left in the creature
+  list"). Choosing a map zeroes the lobby's creature rows and sets them from GlobalVariables.kwd and the map
+  (0x53F150 / 0x53F600 / 0x548E70), and neither gives the Stone Knight any. Its row now gets 16 after that while
+  Stone Knights are on. Not built or tested.
+- 2026-11-20: royals stuck making a bed. They have no bed object (Creatures.kwd: King Reginald, the Princes, Lord of
+  the Land and others are 0). Two Lair state handlers (0x46F4F0 and the arrival 0x46F6B0) do not check for one, and
+  0x46F6B0 retries at another spot for ever when the bed cannot be made. CreatureFixes makes both do nothing for a
+  creature with no bed. Not built or tested.
+- 2026-11-22: chickens hatching outside the Hatchery. The egg's own state (0x18, 0x4A21C0) throws it off its pen at
+  4 seconds old (the pen's facing give or take 0x80, speed 0x6000 across and 0x3000 up). Its hatching state (0x20,
+  0x4A1CF0) makes the chicken wherever the egg stopped, with no room check, so an egg that bounced out of the room
+  gave a chicken outside it. The object state table is at 0x6E4B40 + 0x14 per state (handler at + 4). GameFixes now
+  hooks 0x4A1CF0 and puts a stray egg on the nearest tile of its owner's Hatchery first. Not built or tested.
+- 2026-11-22: changed to stopping the egg at the room's edge instead of moving it back at hatching. The egg's
+  state 0x18 (0x4A21C0) runs every turn while it rolls; after it, an egg off its owner's Hatchery tiles is put on the
+  nearest point inside them and its speed across (+ 0x104, + 0x108) is zeroed. A thing's speed is + 0x104/0x108/0x10C
+  (0x4B1F20 adds to it). The check at 0x4A1CF0 stays as a backup. Not built or tested.
+- 2026-11-22: graphics detail, first look. The game's models are progressive meshes: the video settings (0x759A78)
+  hold "PMesh Reduction Level" at + 0xA4 (0x759B1C, 0 when missing; reader 0x565390, writer 0x5647A2), and the engine
+  start (0x59864C) copies it to 0x760AB0 through 0x5747C0, or 16 in play mode 5. Two mesh draw set-ups (0x580FC5 and
+  0x584A05, the same code; skipped when the mesh's flags + 0x50 / + 0x4C have 0x4000) work out a detail value per mesh:
+  v = (460 / focal * r - t) / (10 - t) - reduction / 16, with t = 1 + 6 * min(s, 0.5) (r and s are locals not yet
+  identified, focal is 0x760AE8), clamped to 0..1 and times 12, stored at + 0x70 / + 0x7C. Which end (0 or 12) is the
+  full mesh is not yet known: reduction lowers v, which suggests 12 is full detail, but r may be the distance.
+  Other video settings by name: Texture Reduction Level, High Res Textures, Machine Spec Level, View Distance, Shadow
+  Level, HighWalls, Torture Details, Cheap Lighting, Sine Wave Water, Translucent Water, EnvironmentMapping.
+- 2026-11-22: model detail and texture filtering written (not built or tested). 0 is the whole mesh: the per-mesh value
+  grows with depth, and a mesh with flag 0x4000 skips the sum and gets 0. So model_detail: full hands the engine 16
+  (as play mode 5 does), which makes every value 0. View Distance is never read in this build (only its setter
+  0x566320 writes it); Shadow Level is 0 to 3 and already 3 by default. texture_filtering: our own CPU mip levels for
+  the game's textures and anisotropic samplers in all three backends (Vulkan samplers also had maxLod 0 before).
+- 2026-11-22: model smoothing written (not built or tested): PN triangles on the CPU in the layer, for depth-written,
+  unblended, non-liquid draws, before culling. Cracks are avoided by curving only edges with two triangles in the
+  draw and two smooth corners, with their points shared; other edges stay straight and uncut.
+- 2026-11-22: model smoothing, first test: 60 fps at 4K, but the terrain was smoothed too and the dig selection drawn over
+  it showed the floor through it in triangles (the floor bulged, the overlay was cut differently). Now only batches that
+  creatures' (CEngineAnimMesh, add 0x5848B0) or objects' (CEngineDynamicMesh, add 0x582CE0) meshes added triangles to
+  are smoothed (hooks on the batch start 0x589D90 and draw 0x58A150). Not tested yet.
+- 2026-11-22: videos frozen after alt-tab. The video's focus handler (0x53C2E0) toggles play and pause on every focus
+  event from 0x558C70 (WM_ACTIVATE, WM_ACTIVATEAPP, WM_NCACTIVATE; 0 coming, 1 lost), so an odd number of events left it
+  paused. Now it plays on 0 and pauses on 1, only when not so already. Not built or tested.
+- 2026-11-22: payday picked the Treasury or Heart nearest in a straight line (0x472390, distance 0x43C260), so walls did
+  not count. Now measured by the game's own path search (0x4D0E10), added up along its waypoints. Not built or tested.
+- 2026-11-23: went through the other 19 straight-line distance calls. 11 choose a room to walk to right after the
+  creature's reachability check (gold, workers' gold drop-off, the rooms' nearest-room methods, the Hatchery among
+  them); those now get the walk's length on the game's scale. The rest are ranges, comparisons or come before any
+  check, and are left alone. Not built or tested.
+- 2026-11-23: possession actions (the user's request: training hits, bed, chickens, Prison door with real prisoners,
+  Combat Pit to the death, free for all). The possessed melee is 0x514830: it asks the world what is in front (vtable
+  + 0x334) and already eats chickens (only when hungry) and plays the dummy's animation (no experience). Found: the
+  Training Room's per-second experience (0x47B2D0), leaving a creature (0x514590), going to bed (0x46F440, sleep left
+  at + 0x2A6 set from data + 0x5D6), the Prison door (an Imp outside opens it, 0x4E29E0; room + 0x51..+ 0x61), the
+  imprison check (state 0x71, 0x473130), the pit entry (state 0x89) and pairing (state 0x8A, 0x457B40: attack targets
+  through 0x48F390), and knock out or die (0x48B770, + 0x3EA bit 0x800). PossessionActions written on those; not built
+  or tested. Open: whether the possessed melee hurts pit fighters, and whether own creatures as own prisoners behave.
+- 2026-11-23: ranged training while possessed: the shot's flight already looks for a Training Target near a possessed
+  creature's shot (0x4ABDF6, shot + 0x151) and makes an effect (0x4ABE54); the effect call now goes through a stub that
+  gives the experience. Chickens walking out of the Hatchery (user saw it): the wander state 0x4A24A0 never checks the
+  room while walking; the object turn 0x49BD20 is hooked to put a chicken back when its turn takes it off its owner's
+  Hatchery. Not built or tested.
+- 2026-11-23: first test of possession actions (user): bed, Prison door and training did nothing. The log showed the
+  hook installed and a chicken eaten through the possessed melee (sound from 0x514BED), but no bed or door. Cause: the
+  thing-in-front search's filter 0x516050 keeps only some object types, not beds (6, 18-27), the Training Target (29)
+  or the Prison Door (109). Hooked it to keep those (also gives the highlight, interface + 0x10BC). Training hits now log
+  their level, the cap (0x6F28FC) and the amount at debug level. Not built or tested.
+- 2026-11-23: second test: training hits logged 3 experience each (0x47B2D0 adds its amount every turn, not every
+  second), now scaled by the turns between hits (1 to 3 seconds). Still no bed or Prison door hit and no log of them:
+  the filter hook now uses its own reach (1.5 tiles) instead of 0x5162E0 and logs each such object it sees. Not built.
+- 2026-11-23: possessed training now costs what the Training Room costs (user: no benefit from possession). The
+  room's handler 0x47B2D0 charges the global at 0x6F291D every second through 0x4BA420 and shows the gold over the
+  creature every 4 seconds (0x50FB70); a hit pays for the turns it counts and shows that. The training code now gets
+  the world from its callers (the game's own code uses 0x6E5050, ours read 0x6E5054). Not built or tested.
+- 2026-11-23: third test: PossessionActions did not install at all ("unexpected game code at 0x50fb70"): LevelEditor
+  already hooks that function (ShowMoneyText), so its first bytes were our hook's jump. Functions PossessionActions only
+  calls now pass the check when they start with a jump; the two it hooks still need the game's own bytes. The bed and
+  Prison door changes were therefore never tested.
+- 2026-11-23: fourth test (user): bed and training work [verified in game]. The Prison door (type 109) was seen by the
+  aim filter but always "out of reach" (1.5 tiles from the object's place). Now a Prison door also counts within a tile
+  of its tile's nearest edge, and the log gives the distances. Prison and Combat Pit still untested past this point.
+- 2026-11-23: fifth test: the Prison door came in reach (from its tile about 2100 to 3400, from itself 4200 to 6900,
+  in 1/4096 tile) but was never hit: the creature cannot get closer through the fence and the search's later tests did
+  not choose it. The user's screenshot shows the game names the bolt beside it "Prison Bolt" (type 116). Now the search
+  0x515420 is hooked and, when it finds nothing, gives the keeper's Prison door or bolt in reach and in view; a hit on
+  either opens the door. Not built or tested.
+- 2026-11-23: sixth test: the bolt (116) is highlighted and hit, but nobody became a prisoner. Cause: the melee code
+  still only took the door (109) as a Prison hit (an earlier edit changed the aim check instead), so bolt hits were the
+  game's plain attack and no visit ever started. Fixed; the door is no longer aimed at (user: the bolt is enough). Also:
+  a door the room already counts open has no countdown and never closes, so a hit then starts it, and a settled visit
+  closes the door itself after 3 seconds. Aim log lines removed (they flooded the log). Not built or tested.
+- 2026-11-23: seventh test: the bolt opens the door and the visit closes on the creature ("closed on creature 447 and 1
+  follower(s)"), but nobody became a prisoner: state 0x71 (0x473130) did not take. Now 0x71 then 0x73 and the holder are
+  set directly, with every result and the state a second later in the log. Not built or tested.
+- 2026-11-23: eighth test: 0x71 accepted, 0x73 refused, both creatures back to state 7 a second later. The prisoner
+  group's enter handler 0x47B740 calls the room's add (0x4E5A70), which for a Prison refuses a creature on the fence
+  ring or door tile (0x454110: tile + 0xC must be -1) or with no room left. The creatures were just inside the door.
+  Now the door waits until they are past the edge. Not built or tested.
+- 2026-11-23: ray tracing too heavy (user). Added ray_tracing_rate (traces a second, 30 by default; frames between
+  reuse the last result and skip collecting and building), shadow rays only to the 4 strongest lights at a pixel, and a
+  32-entry traversal stack. Not built or tested; VulkanShaders.h needs regenerating.
+- 2026-11-23: ray tracing lighter, second step: checkerboard traces (half the pixels a trace, the rest kept from the trace
+  before) and fewer rays at medium and low quality. The depth buffer idea was dropped at the owner's choice after weighing
+  it (some 10 to 15% for changes in all three backends). Not built or tested; VulkanShaders.h needs regenerating.
+- 2026-11-23: ninth test: the bolt opened the door but no visit line followed: the room's own countdown (2 seconds)
+  closed the door before the creature walked in, and the visit ended without a log. The door now waits up to 10
+  seconds for the creature to come in from the bolt, and every end of a visit is logged with its reason. Ray tracing in
+  the same log: traced at 1280x720 (4K, medium), trees of 2,700 to 11,000 triangles built in 2 to 10 ms, VulkanShaders.h
+  regenerated after the shader change.
+- 2026-11-23: tenth test: the doorway stays solid for a possessed creature (user: an invisible wall), and it cannot walk
+  off the pit's edge; no follower ever reached the pit floor. New design (the user's idea): touching the armed doorway
+  puts the creature on a cell tile as a prisoner, followers walk to that spot and follow; facing the pit floor from the
+  edge jumps down, followers at the edge are put down too, facing out from the floor climbs out with the survivors. Not
+  built or tested.
+- 2026-11-24: Prison works [verified in game, user]. Combat Pit worked for the possessed creature only; leaving
+  possession set everyone in the pit idle (the old end of a match). Now jumping in ends possession, followers walk to
+  the jump spot and are put in, and the game's own pit fights run. Not built or tested.
+- 2026-11-24: eleventh test [verified in game: log]: the Prison took the possessed creature and both followers (state
+  0x73, then 0x74 a second later, holder the keeper). Combat Pit: jumping in ended possession, three followers were put
+  in and fought (pit fighters, held by the keeper, 26 hits). Two followers of a second jump were taken by their own jobs
+  (0x59, then 7) and never sent again (only idle ones were); now any follower not walking is sent again each second.
+- 2026-11-24: twelfth test [verified in game: log]: Combat Pit to the death works. All four followers reached the jump
+  spot (the re-send fix) and were put in; 438, 444, 440 and 447 died one by one (fight state 0xC7, then 1, then gone;
+  no knock out, 0xD8, anywhere), and 443 won and was lifted out.
+- 2026-11-24: user: training gold works, chicken feeding works [verified in game]; ranged shots at the Training
+  Target do nothing and are not highlighted. The ranged search (vtable + 0x338, 0x515520) never picks the target, so
+  shots were not aimed at it; now hooked to give a Training Target in view. Not built or tested.

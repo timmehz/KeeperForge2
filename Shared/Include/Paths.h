@@ -10,6 +10,8 @@ namespace KeeperForge2::Paths {
 	std::filesystem::path Mods();
 	// Levels saved from the editor. Made when the first one is saved.
 	std::filesystem::path Maps();
+	// Custom campaigns, one folder each (docs/game/custom-campaign.md). Mods install theirs here too.
+	std::filesystem::path Campaigns();
 	// Creates the folder and its Logs and mods folders. Returns false if one could not be made.
 	bool CreateFolders();
 }

@@ -1,5 +1,6 @@
 #include "SkirmishSwapKeeper.h"
 #include "CoopCampaign.h"
+#include "CustomCampaign.h"
 #include "FrontEndTexts.h"
 #include "GameAddresses.h"
 #include "HookManager.h"
@@ -367,7 +368,10 @@ namespace KeeperForge2 {
 			playingGood = false;
 			originalSetup(frontEnd);
 			SetStartPlayer(Game::FirstKeeperPlayer);
+			// The campaign list or a campaign's level takes the skirmish screen's place before it is drawn.
+			CustomCampaign::AfterSkirmishSetup(frontEnd);
 		}
+		bool setupHooked = false;
 
 		void MakeButton(std::uint8_t* entry, const std::uint8_t* addComputer, std::int32_t id, std::int16_t y, void (__cdecl* click)(std::int32_t, std::int32_t, std::uint8_t*), char (__cdecl* render)(std::uint8_t*, std::uint8_t*)) {
 			std::memcpy(entry, addComputer, Game::ButtonConfigSize);
@@ -459,6 +463,8 @@ namespace KeeperForge2 {
 		}
 	}
 
+	bool SkirmishSwapKeeper::SetupHooked() { return setupHooked; }
+
 	void SkirmishSwapKeeper::Install() {
 		const auto windowConfig = Game::Resolve(Game::Address::SkirmishWindowConfig);
 		const auto buttons = Memory::Read<std::uint32_t>(windowConfig + Game::Offset::WindowConfigButtons);
@@ -485,6 +491,7 @@ namespace KeeperForge2 {
 			Logger::Warning("Skirmish: failed to hook the skirmish setup, Swap Keeper left out.");
 			return;
 		}
+		setupHooked = true;
 		FrontEndTexts::Add(Game::SkirmishWindowId, {
 			{ SwapButtonId, L"Swap Keeper" },
 			{ SwapButtonId, L"Pick a Keeper (Cancel)" },

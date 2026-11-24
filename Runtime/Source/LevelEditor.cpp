@@ -1,4 +1,5 @@
 #include "LevelEditor.h"
+#include "CustomCampaign.h"
 #include "Config.h"
 #include "CreatureRegistry.h"
 #include "EditorDialogs.h"
@@ -46,13 +47,18 @@ namespace KeeperForge2 {
 		// Continue Campaign ends at 760. Editor takes the next row, and the rows below move down, keeping the game's
 		// larger step before Skirmish.
 		constexpr std::int16_t EditorButtonY = 768;
-		constexpr std::int16_t SkirmishButtonY = 1032;
-		constexpr std::int16_t LoadGameButtonY = 1212;
+		// Custom Campaign (CustomCampaign.cpp) the row after Editor; Skirmish and Load Game one row (180) further down.
+		constexpr std::int32_t CampaignButtonId = 9101;
+		constexpr std::int16_t CampaignButtonY = 948;
+		constexpr std::int16_t SkirmishButtonY = 1212;
+		constexpr std::int16_t LoadGameButtonY = 1392;
 		// The game bakes this window's text images in list order: New Campaign 0, Continue 1, Skirmish 2, Load Game 3. Ours
 		// goes last in the list, so theirs keep their numbers, whatever its place on screen.
 		constexpr std::int32_t EditorImageIndex = 4;
+		constexpr std::int32_t CampaignImageIndex = 5;
 		// A text id no game text uses: the baker asks for the button's text by id, and this one gets ours.
 		constexpr std::int32_t EditorTextId = 60000;
+		constexpr std::int32_t CampaignTextId = 60001;
 		// The high word of a menu click's second argument is the button's image number.
 		constexpr std::uint32_t ClickImageShift = 16;
 		constexpr std::size_t ClickSecondArgument = Game::Offset::ButtonConfigClickArgument + 4;
@@ -88,6 +94,12 @@ namespace KeeperForge2 {
 			armed = false;
 			gameSkirmishClick(first, second, frontEnd);
 		}
+		// Custom Campaign opens the skirmish screen too; CustomCampaign then shows its campaigns in the map list.
+		void __cdecl OnCampaignClick(std::int32_t first, std::int32_t second, std::uint8_t* frontEnd) {
+			armed = false;
+			CustomCampaign::OnMenuButton();
+			gameSkirmishClick(first, second, frontEnd);
+		}
 
 		using TextByIdFn = const char*(__cdecl*)(std::int32_t id);
 		using ConvertTextFn = void(__cdecl*)(const wchar_t* text, void* out, std::int32_t size);
@@ -102,6 +114,12 @@ namespace KeeperForge2 {
 				static decltype(editorText) terrainTabText{};
 				if (terrainTabText[0] == 0) GameFunction<ConvertTextFn>(Game::Address::ConvertText)(L"Terrain", terrainTabText.data(), static_cast<std::int32_t>(terrainTabText.size()));
 				return terrainTabText.data();
+			}
+			if (const char* text = CustomCampaign::TextById(id)) return text;
+			if (id == CampaignTextId) {
+				static decltype(editorText) campaignText{};
+				if (campaignText[0] == 0) GameFunction<ConvertTextFn>(Game::Address::ConvertText)(L"Custom Campaign", campaignText.data(), static_cast<std::int32_t>(campaignText.size()));
+				return campaignText.data();
 			}
 			if (id != EditorTextId) return originalTextById(id);
 			if (editorText[0] == 0) GameFunction<ConvertTextFn>(Game::Address::ConvertText)(L"Editor", editorText.data(), static_cast<std::int32_t>(editorText.size()));
@@ -118,7 +136,7 @@ namespace KeeperForge2 {
 				const auto* entry = buttons + count * Game::ButtonConfigSize;
 				const auto id = Load<std::int32_t>(entry + Game::Offset::ButtonConfigId);
 				if (id == ButtonListEnd) break;
-				if (id == EditorButtonId) return false;
+				if (id == EditorButtonId || id == CampaignButtonId) return false;
 				if (id == SkirmishButtonId) skirmish = entry;
 				if (id == ContinueCampaignButtonId) continueFound = true;
 				if (id == LoadGameButtonId) loadFound = true;
@@ -126,7 +144,7 @@ namespace KeeperForge2 {
 			if (count == MaxButtons || skirmish == nullptr || !continueFound || !loadFound) return false;
 			gameSkirmishClick = reinterpret_cast<ClickFn>(Load<std::uint32_t>(skirmish + Game::Offset::ButtonConfigClick));
 
-			buttonList.assign((count + 2) * Game::ButtonConfigSize, 0);
+			buttonList.assign((count + 3) * Game::ButtonConfigSize, 0);
 			std::memcpy(buttonList.data(), buttons, count * Game::ButtonConfigSize);
 			for (std::size_t index = 0; index < count; ++index) {
 				auto* entry = buttonList.data() + index * Game::ButtonConfigSize;
@@ -149,7 +167,17 @@ namespace KeeperForge2 {
 			Store<std::int32_t>(editor + Game::Offset::ButtonConfigTextIndex, EditorImageIndex);
 			const auto second = Load<std::uint32_t>(editor + ClickSecondArgument);
 			Store<std::uint32_t>(editor + ClickSecondArgument, (second & 0xFFFF) | (static_cast<std::uint32_t>(EditorImageIndex) << ClickImageShift));
-			std::memcpy(editor + Game::ButtonConfigSize, buttons + count * Game::ButtonConfigSize, Game::ButtonConfigSize);
+			// Custom Campaign, the same way, after Editor in the list (its image number 5).
+			auto* campaign = editor + Game::ButtonConfigSize;
+			std::memcpy(campaign, skirmish, Game::ButtonConfigSize);
+			Store<std::int32_t>(campaign + Game::Offset::ButtonConfigId, CampaignButtonId);
+			Store<std::int16_t>(campaign + Game::Offset::ButtonConfigY, CampaignButtonY);
+			Store<std::uint32_t>(campaign + Game::Offset::ButtonConfigClick, reinterpret_cast<std::uint32_t>(&OnCampaignClick));
+			Store<std::int32_t>(campaign + Game::Offset::ButtonConfigTextId, CampaignTextId);
+			Store<std::int32_t>(campaign + Game::Offset::ButtonConfigTextIndex, CampaignImageIndex);
+			const auto campaignSecond = Load<std::uint32_t>(campaign + ClickSecondArgument);
+			Store<std::uint32_t>(campaign + ClickSecondArgument, (campaignSecond & 0xFFFF) | (static_cast<std::uint32_t>(CampaignImageIndex) << ClickImageShift));
+			std::memcpy(campaign + Game::ButtonConfigSize, buttons + count * Game::ButtonConfigSize, Game::ButtonConfigSize);
 			return true;
 		}
 

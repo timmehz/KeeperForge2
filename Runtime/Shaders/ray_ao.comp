@@ -1,0 +1,273 @@
+#version 450
+// Ray traced ambient occlusion and shadows, our own tracer (see docs/game/ray-tracing.md): for each pixel of the result
+// (half the frame's size), a ray from the camera finds the surface it sees in the scene's tree. Rays over the half sphere
+// above that surface look for anything within the radius (ambient occlusion), and a ray to each of the scene's lights in
+// reach looks for anything in between (shadows). Writes how much light the point keeps (1 all, 0 none) and its depth,
+// for the blur pass. Where the camera ray meets water or lava (a mirror triangle), a reflected ray finds what it shows;
+// that point's color is read from the frame (the scene is what the camera sees, so it is on screen), and written with
+// how much of it shows. Bounce light: rays over the half sphere find nearby surfaces, whose colors (from the frame too)
+// are averaged into the light bounced onto the point, for the blur pass.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// Two vec4 per node: min and leftOrFirst (as int bits), max and count (as int bits). Three per triangle: a corner and
+// two edges.
+layout(std430, binding = 0) readonly buffer Nodes { vec4 nodes[]; };
+layout(std430, binding = 1) readonly buffer Triangles { vec4 triangles[]; };
+layout(std430, binding = 2) writeonly buffer Raw { vec2 raw[]; };
+// Two vec4 per light: position and reach, color and strength.
+layout(std430, binding = 4) readonly buffer Lights { vec4 lights[]; };
+// The frame as the game drew it so far, and the reflections (BGRA, alpha how much shows).
+layout(binding = 5) uniform sampler2D frame;
+layout(std430, binding = 6) writeonly buffer Reflections { uint reflections[]; };
+// The bounced light before smoothing (rgb).
+layout(std430, binding = 7) writeonly buffer BounceRaw { vec4 bounceRaw[]; };
+
+// RayTraceSettings in Backend.h.
+layout(push_constant) uniform Settings {
+	uvec2 size;
+	vec2 frameSize;
+	vec2 center;
+	float focal;
+	float radius;
+	uint rays;
+	uint frame;
+	uint nodeCount;
+	uint triangleCount;
+	uint lightCount;
+	float occlusion;
+	float shadows;
+	float ambient;
+	float reflections;
+	float reflectReach;
+	float bounce;
+	float bounceReach;
+} settings;
+
+const float Infinity = 1e30;
+
+// Distance to the triangle along the ray, or Infinity. Both sides count.
+float HitTriangle(vec3 origin, vec3 direction, uint triangle) {
+	vec3 corner = triangles[triangle * 3u].xyz;
+	vec3 edge1 = triangles[triangle * 3u + 1u].xyz;
+	vec3 edge2 = triangles[triangle * 3u + 2u].xyz;
+	vec3 p = cross(direction, edge2);
+	float determinant = dot(edge1, p);
+	if (abs(determinant) < 1e-12) return Infinity;
+	float reciprocal = 1.0 / determinant;
+	vec3 toOrigin = origin - corner;
+	float u = dot(toOrigin, p) * reciprocal;
+	if (u < 0.0 || u > 1.0) return Infinity;
+	vec3 q = cross(toOrigin, edge1);
+	float v = dot(direction, q) * reciprocal;
+	if (v < 0.0 || u + v > 1.0) return Infinity;
+	float t = dot(edge2, q) * reciprocal;
+	return t > 0.0 ? t : Infinity;
+}
+
+// Where the ray enters the box (0 if it starts inside), or Infinity when it misses it within limit.
+float HitBox(vec3 origin, vec3 inverseDirection, vec3 low, vec3 high, float limit) {
+	vec3 t0 = (low - origin) * inverseDirection;
+	vec3 t1 = (high - origin) * inverseDirection;
+	vec3 entries = min(t0, t1);
+	vec3 exits = max(t0, t1);
+	float entry = max(max(entries.x, entries.y), max(entries.z, 0.0));
+	float exit = min(min(exits.x, exits.y), min(exits.z, limit));
+	return entry <= exit ? entry : Infinity;
+}
+
+// The nearest hit within limit (any hit when anyHit is set): its distance (Infinity for none) and triangle. With solidOnly,
+// mirror triangles (water, lava) are passed through.
+float Trace(vec3 origin, vec3 direction, float limit, bool anyHit, bool solidOnly, out uint hitTriangle) {
+	hitTriangle = 0xFFFFFFFFu;
+	if (settings.nodeCount == 0u) return Infinity;
+	vec3 inverseDirection = 1.0 / mix(direction, vec3(1e-20), equal(direction, vec3(0.0)));
+	float nearest = limit;
+	// 32 is ample for the tree's depth (leaves of 2 to 16 of a few thousand triangles) and half the private memory.
+	uint stack[32];
+	uint depth = 0u;
+	stack[depth++] = 0u;
+	while (depth > 0u) {
+		uint node = stack[--depth];
+		vec4 low = nodes[node * 2u];
+		vec4 high = nodes[node * 2u + 1u];
+		if (HitBox(origin, inverseDirection, low.xyz, high.xyz, nearest) == Infinity) continue;
+		uint leftOrFirst = uint(floatBitsToInt(low.w));
+		uint count = uint(floatBitsToInt(high.w));
+		if (count > 0u) {
+			for (uint i = 0u; i < count; ++i) {
+				if (solidOnly && triangles[(leftOrFirst + i) * 3u].w > 0.5) continue;
+				float t = HitTriangle(origin, direction, leftOrFirst + i);
+				if (t < nearest) {
+					nearest = t;
+					hitTriangle = leftOrFirst + i;
+					if (anyHit) return t;
+				}
+			}
+			continue;
+		}
+		// Nearer child last, so it is looked at first.
+		vec4 leftLow = nodes[leftOrFirst * 2u];
+		vec4 leftHigh = nodes[leftOrFirst * 2u + 1u];
+		vec4 rightLow = nodes[(leftOrFirst + 1u) * 2u];
+		vec4 rightHigh = nodes[(leftOrFirst + 1u) * 2u + 1u];
+		float leftNear = HitBox(origin, inverseDirection, leftLow.xyz, leftHigh.xyz, nearest);
+		float rightNear = HitBox(origin, inverseDirection, rightLow.xyz, rightHigh.xyz, nearest);
+		if (depth + 2u > 32u) continue;
+		if (leftNear <= rightNear) {
+			if (rightNear != Infinity) stack[depth++] = leftOrFirst + 1u;
+			if (leftNear != Infinity) stack[depth++] = leftOrFirst;
+		}
+		else {
+			if (leftNear != Infinity) stack[depth++] = leftOrFirst;
+			if (rightNear != Infinity) stack[depth++] = leftOrFirst + 1u;
+		}
+	}
+	return hitTriangle == 0xFFFFFFFFu ? Infinity : nearest;
+}
+
+// A steady pattern per pixel and ray (interleaved gradient noise and a ray's golden-ratio step), the same every frame
+// so the picture does not crawl; the blur pass evens it out.
+vec2 Random(uvec2 pixel, uint ray) {
+	float noise = fract(52.9829189 * fract(0.06711056 * float(pixel.x) + 0.00583715 * float(pixel.y)));
+	float a = fract(noise + float(ray) * 0.618034);
+	float b = fract(float(ray) / float(max(settings.rays, 1u)) + noise * 0.5 + 0.5 / float(max(settings.rays, 1u)));
+	return vec2(a, b);
+}
+
+void main() {
+	uvec2 pixel = gl_GlobalInvocationID.xy;
+	if (pixel.x >= settings.size.x || pixel.y >= settings.size.y) return;
+	// Checkerboard: a trace does every other pixel (bit 0 of settings.frame says which half); the rest keep what the
+	// trace before wrote, and the blur pass mixes the two. Bit 1: every pixel (new buffers, or the last trace is old).
+	if ((settings.frame & 2u) == 0u && ((pixel.x + pixel.y + settings.frame) & 1u) != 0u) return;
+	uint index = pixel.y * settings.size.x + pixel.x;
+	// The middle of this result pixel in the frame's own coordinates (the game's pixel centers are whole numbers).
+	vec2 screen = (vec2(pixel) + 0.5) * settings.frameSize / vec2(settings.size) - 0.5;
+	vec3 direction = normalize(vec3((screen - settings.center) / settings.focal, 1.0));
+	uint triangle;
+	reflections[index] = 0u;
+	bounceRaw[index] = vec4(0.0);
+	float hitDistance = Trace(vec3(0.0), direction, Infinity, false, false, triangle);
+	if (hitDistance == Infinity) {
+		raw[index] = vec2(1.0, 0.0);
+		return;
+	}
+	vec3 point = direction * hitDistance;
+	vec3 normal = normalize(cross(triangles[triangle * 3u + 1u].xyz, triangles[triangle * 3u + 2u].xyz));
+	if (dot(normal, direction) > 0.0) normal = -normal;
+	// A frame around the normal for the half sphere.
+	vec3 side = normalize(abs(normal.x) > 0.5 ? cross(normal, vec3(0.0, 1.0, 0.0)) : cross(normal, vec3(1.0, 0.0, 0.0)));
+	vec3 up = cross(normal, side);
+	vec3 start = point + normal * (settings.radius * 0.02);
+	float closed = 0.0;
+	// Water and lava (mirror triangles) are neither shaded nor shadowed: they glow or shine, and reflect instead.
+	bool mirror = triangles[triangle * 3u].w > 0.5;
+	uint aoRays = settings.occlusion > 0.0 && !mirror ? settings.rays : 0u;
+	for (uint ray = 0u; ray < aoRays; ++ray) {
+		// Cosine-weighted: more rays straight out than along the surface, as light falls.
+		vec2 r = Random(pixel, ray);
+		float angle = 6.2831853 * r.x;
+		float along = sqrt(r.y);
+		vec3 out3 = normalize(side * (cos(angle) * along) + up * (sin(angle) * along) + normal * sqrt(max(0.0, 1.0 - r.y)));
+		uint unused;
+		float hit = Trace(start, out3, settings.radius, true, true, unused);
+		// Nearer things close it in more.
+		if (hit != Infinity) closed += 1.0 - hit / settings.radius;
+	}
+	float open = 1.0 - closed / float(max(aoRays, 1u));
+
+	// Bounce light: what nearby surfaces send back, read from the frame where these rays land. Half as many rays as the
+	// ambient occlusion's (at least 2), with their own pattern, nearer surfaces counting more.
+	uint bounceRays = settings.bounce > 0.0 && !mirror ? max(settings.rays / 2u, 2u) : 0u;
+	vec3 bounced = vec3(0.0);
+	for (uint ray = 0u; ray < bounceRays; ++ray) {
+		vec2 r = Random(pixel, ray + 17u);
+		float angle = 6.2831853 * r.x;
+		float along = sqrt(r.y);
+		vec3 out3 = normalize(side * (cos(angle) * along) + up * (sin(angle) * along) + normal * sqrt(max(0.0, 1.0 - r.y)));
+		uint unused;
+		float hit = Trace(start, out3, settings.bounceReach, false, true, unused);
+		if (hit == Infinity) continue;
+		vec3 there = start + out3 * hit;
+		if (there.z <= 1e-3) continue;
+		vec2 onScreen = settings.center + settings.focal * there.xy / there.z;
+		if (any(lessThan(onScreen, vec2(-0.5))) || any(greaterThanEqual(onScreen, settings.frameSize - 0.5))) continue;
+		bounced += textureLod(frame, (onScreen + 0.5) / settings.frameSize, 0.0).rgb * (1.0 - hit / settings.bounceReach);
+	}
+	if (bounceRays > 0u) bounceRaw[index] = vec4(bounced / float(bounceRays), 0.0);
+
+	// Shadows. The game already lit the point with every light in reach (in its vertex colors, without shadows), so the
+	// point keeps the share of its light that still arrives: the ambient light plus each unblocked light, over the
+	// ambient plus all of them. A light counts by its color, strength, how near it is and how squarely it falls. Every
+	// light counts as arriving; only the strongest few here (MostShadowRays) get a ray, and a blocked one is taken out:
+	// the faint rest would hardly show a shadow, and their rays were most of the tracer's work.
+	float arrived = settings.ambient;
+	float total = settings.ambient;
+	uint lightCount = settings.shadows > 0.0 && !mirror ? settings.lightCount : 0u;
+	const uint MostShadowRays = 4u;
+	float strongest[MostShadowRays] = float[MostShadowRays](0.0, 0.0, 0.0, 0.0);
+	uint strongestLight[MostShadowRays] = uint[MostShadowRays](0u, 0u, 0u, 0u);
+	for (uint light = 0u; light < lightCount; ++light) {
+		vec4 placeAndReach = lights[light * 2u];
+		vec4 colorAndStrength = lights[light * 2u + 1u];
+		vec3 toLight = placeAndReach.xyz - point;
+		float away = length(toLight);
+		if (away >= placeAndReach.w || away < 1e-4) continue;
+		float facing = dot(normal, toLight / away);
+		if (facing <= 0.0) continue;
+		float falloff = 1.0 - away / placeAndReach.w;
+		float share = dot(colorAndStrength.rgb, vec3(0.3333)) * colorAndStrength.a * falloff * falloff * facing;
+		if (share <= 0.0) continue;
+		total += share;
+		arrived += share;
+		// Too faint here to show a shadow: no ray.
+		if (share < 0.03 || share <= strongest[MostShadowRays - 1u]) continue;
+		uint slot = MostShadowRays - 1u;
+		while (slot > 0u && strongest[slot - 1u] < share) {
+			strongest[slot] = strongest[slot - 1u];
+			strongestLight[slot] = strongestLight[slot - 1u];
+			--slot;
+		}
+		strongest[slot] = share;
+		strongestLight[slot] = light;
+	}
+	for (uint slot = 0u; slot < MostShadowRays; ++slot) {
+		if (strongest[slot] <= 0.0) break;
+		vec3 toLight = lights[strongestLight[slot] * 2u].xyz - point;
+		float away = length(toLight);
+		// Stops short of the light: a lamp or torch sits inside its own model, which must not shadow it.
+		float limit = away - min(0.25, away * 0.5);
+		uint unused;
+		if (limit > 0.0 && Trace(start, toLight / away, limit, true, true, unused) != Infinity) arrived -= strongest[slot];
+	}
+	float lit = total > 0.0 ? arrived / total : 1.0;
+
+	float keep = mix(1.0, open, clamp(settings.occlusion, 0.0, 1.0)) * mix(1.0, lit, clamp(settings.shadows, 0.0, 1.0));
+
+	// Water and lava show what their reflection ray meets.
+	if (mirror) {
+		if (settings.reflections > 0.0) {
+			vec3 reflected = reflect(direction, normal);
+			uint seen;
+			float travelled = Trace(point + normal * (settings.radius * 0.02), reflected, settings.reflectReach, false, true, seen);
+			if (travelled != Infinity) {
+				vec3 shown = point + normal * (settings.radius * 0.02) + reflected * travelled;
+				if (shown.z > 1e-3) {
+					vec2 onScreen = settings.center + settings.focal * shown.xy / shown.z;
+					if (all(greaterThanEqual(onScreen, vec2(-0.5))) && all(lessThan(onScreen, settings.frameSize - 0.5))) {
+						vec3 color = textureLod(frame, (onScreen + 0.5) / settings.frameSize, 0.0).rgb;
+						// More at a glancing look (Schlick's Fresnel), fading toward the reach and the picture's edges.
+						float facing = clamp(dot(-direction, normal), 0.0, 1.0);
+						float fresnel = 0.02 + 0.98 * pow(1.0 - facing, 5.0);
+						vec2 edge = min(onScreen, settings.frameSize - onScreen) / (settings.frameSize * 0.08);
+						float fade = clamp(min(edge.x, edge.y), 0.0, 1.0) * (1.0 - travelled / settings.reflectReach);
+						float amount = clamp(settings.reflections * (0.3 + 0.7 * fresnel) * fade, 0.0, 1.0);
+						uvec4 bytes = uvec4(clamp(vec4(color.b, color.g, color.r, amount), 0.0, 1.0) * 255.0 + 0.5);
+						reflections[index] = bytes.x | (bytes.y << 8) | (bytes.z << 16) | (bytes.w << 24);
+					}
+				}
+			}
+		}
+	}
+	raw[index] = vec2(keep, point.z);
+}

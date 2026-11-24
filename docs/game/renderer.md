@@ -157,6 +157,10 @@ real work tells what the game calls. In plain terms:
 - 0x53C2E0 handles the game's activate events while a video plays: on each one
   0x5A8FF0 toggles the player between playing (3) and paused (4), stopping or
   starting its sound buffer. It is a toggle, so the events must alternate.
+  They come from 0x558C70 (WM_ACTIVATE, WM_ACTIVATEAPP and WM_NCACTIVATE: event 0
+  for focus coming, 1 for focus lost), three each way per switch but not always,
+  so a video could stay paused. GameFixes now plays or pauses it as the event
+  says (see game-fixes.md). [verified in the export]
 - patch.dll minimizes the game's window when it loses focus, and sends the
   window WM_ACTIVATE when the first DirectDraw 2 surface is made. [reference]
 
@@ -282,9 +286,76 @@ real work tells what the game calls. In plain terms:
   - Vulkan needs VulkanShaders.h made again from the GLSL (compile_vulkan_shaders.bat); until then its shader passes
     the bump stage through without moving anything.
 
+## Model detail (model_detail) [verified in the export; not tested in game]
+- The game's models are progressive meshes. Its video settings (0x759A78) hold "PMesh Reduction Level" at + 0xA4
+  (0x759B1C; 0 when not saved). The engine start reads it once ("mov eax, [0x759B1C]" at 0x59864C) and keeps it at
+  0x760AB0 (0x5747C0); in play mode 5 it is given 16 instead.
+- Each mesh's detail is worked out where it is set up to be drawn (0x580FC5 and 0x584A05, the same code):
+  v = (460 / focal * depth - t) / (10 - t) - level / 16, t = 1 + 6 * min(radius, 0.5), kept to 0..1 and times 12
+  (mesh + 0x70 or + 0x7C). It grows with depth and shrinks with size, and a mesh with flag 0x4000 skips the sum and
+  gets 0, so 0 is the whole mesh and 12 the fewest triangles. A level of 16 or more makes every v 0.
+- model_detail: full (the default) patches that one read into "mov eax, 16", so every model is whole at any distance,
+  as the game does itself in play mode 5. The saved setting is not changed. game keeps the game's own way
+  (ModelDetail.cpp).
+- The other video settings, for the record: View Distance (+ 0x50, default 12) is only written (0x566320) and never
+  read in this build, so it changes nothing. Shadow Level (+ 0x54, 0 to 3, the in-game slider, default 3) goes to
+  0x764BDC; the engine only tests it below 3. High Res Textures (+ 0x78, default on) and Texture Reduction Level
+  (+ 0x7C, 0 to 2, default 0) already default to the best.
+
+## Texture filtering (texture_filtering) [written; not built or tested]
+- The game makes no mip levels, so far textures shimmer and slanted floors blur or alias. With texture_filtering
+  trilinear or anisotropic x2/x4/x8/x16 (x16 by default):
+  - The layer gives each of the game's textures (texture surfaces, not bump maps) every mip level down to 1x1
+    (MipLevelCount), made on the CPU with our own 2x2 box filter (HalveMip) each time the texture is uploaded.
+    Colors are weighted by alpha so see-through texels do not bleed in. A texture whose alpha is only 0 or 255
+    (cut-outs for the alpha test) keeps it so: a texel is opaque when at least half of what it covers is, so
+    cut-outs do not thin out far away.
+  - Backend::CreateTexture takes a level count and UpdateTexture a level (DirectX 11 UpdateSubresource of that
+    subresource; DirectX 12 CopyTextureRegion into that subresource; Vulkan a copy into that level, barriers over
+    every level). Other textures (the frame's copies, blit pictures, the ray tracer's) keep one level.
+  - Samplers: linear ones are anisotropic at the chosen level (DirectX FILTER_ANISOTROPIC, Vulkan anisotropyEnable
+    with samplerAnisotropy turned on for the device when it has it; a device with it allows at least 16). Vulkan's
+    samplers now use mip levels (mipmap mode as the filter, maxLod VK_LOD_CLAMP_NONE; before, maxLod was 0).
+    DirectX samplers already had MIP_LINEAR / MIP_POINT and no level limit.
+  - off: one level and no anisotropy, as before.
+- Watch for: textures that are pages of several pictures could bleed into each other at the smallest levels; text or
+  panels drawn smaller than their texture now look smoother (they were sampled from the full picture before).
+
+## Model smoothing (model_smoothing) [written; not built or tested]
+- More triangles for round shapes, made by our own code (Source/Renderer/ModelSmoothing.*) from the game's triangles
+  as they reach the layer; no game file or model is read or changed. low, medium (the default) or high cut each curved
+  edge into 2, 3 or 4; off draws the game's triangles as they come.
+- Which draws: only creatures' and objects' meshes. The engine draws the world in batches (0x58F640: 0x589D90 starts
+  one, each queued primitive adds its triangles through its vtable + 4, 0x58A150 draws it); ModelDetail.cpp hooks the
+  start and the draw and the adds of CEngineAnimMesh (0x5848B0) and CEngineDynamicMesh (0x582CE0) [class names
+  reference: Flame's mapping], and a batch they added to is a model batch. Of those, only draws that are depth tested
+  and written, not blended, and without a bump mapping stage.
+- Tested first on every depth-written draw (2026-11-22): the terrain was curved too. Its floors are slightly uneven, so
+  they bulged, and the overlays the game draws again over the same tiles (the dig selection, highlights) were cut up
+  differently or not at all, and the floor showed through them in triangles. So terrain is never smoothed now.
+- How (PN triangles): each corner goes back into the camera's space with the engine's projection (as the ray tracer
+  reads it: 0x760AE8 focal, 0x760AFC/0x760B00 middle; WidescreenCamera's focal and the frame's middle when there is
+  none): z = 1 / rhw, x and y undone from screen = middle + focal * view / z. Corners at the same screen place (x, y
+  and rhw, bit for bit) are one corner, so texture seams do not split a model. A corner's normal is the size-weighted
+  average of its faces; it is smooth when every face is within 60 degrees of it.
+- An edge curves only when it has exactly two triangles in the draw, running opposite ways, both corners are smooth,
+  and its curve's middle moves at least 0.35 pixel (and no more than half the edge's length). Its curve depends on its
+  two corners and their normals alone, and its points are worked out once and shared by both triangles, so they meet
+  exactly. Every other edge (a crease, a draw's border, an outline drawn by another draw) stays straight and uncut, so
+  no cracks open between draws. Flat surfaces have normals square to their edges, so nothing on them curves.
+- A triangle with three curved edges is cut into a grid of segments² triangles on its curved patch; one with one or
+  two is a fan from the patch's middle through every point of its edges; one with none stays as it was. Colors and
+  texture coordinates are mixed by the patch's weights (as the card would across the flat triangle); depth comes from
+  the triangle's own z = a + b * rhw.
+- It runs on every triangle before back faces are culled (the layer culls on the CPU), so an outline's far side is
+  known and outlines round off too; the result is culled after. The ray tracer still gets the game's own triangles.
+- More than 65535 vertices in one draw: that draw is left as it was.
+- Watch for: thin dark lines or gaps along a model's edges, shapes that swell where they should not (a box's sides),
+  the cost on the CPU in busy scenes (log at debug: the first smoothed draw's triangles before and after). First test
+  (4K, Vulkan): 60 fps, the first smoothed draw 50 triangles into 190.
+
 ## Not done
-- Gamma (ignored, as by patch.dll), flat shading (drawn smooth), mip maps (the game makes
-  none here).
+- Gamma (ignored, as by patch.dll), flat shading (drawn smooth).
 - The frame is read back whenever the game blits its 2D panels onto it, which
   costs a GPU wait each frame. If that is slow, the next step is doing those
   blits on the GPU. At 3840x2160 that is 33 MB read back and 33 MB uploaded

@@ -1,6 +1,9 @@
 #include "Backend.h"
 #include "ShaderSources.h"
+#include "RayHlsl.h"
+#include "Config.h"
 #include "Logger.h"
+#include "StringUtils.h"
 #include <Windows.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
@@ -65,6 +68,8 @@ namespace KeeperForge2::Render {
 
 				bool Init(HWND target) override {
 					window = target;
+					if (StringUtils::ToLower(Config::GetString("ray_tracing", "off")) == "on")
+						Logger::Info("Ray tracing: DirectX 11 has no hardware ray tracing; KeeperForge2's own tracer runs in its compute shaders.");
 					const D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0 };
 					HRESULT result = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, ARRAYSIZE(levels),
 						D3D11_SDK_VERSION, &device, nullptr, &context);
@@ -182,11 +187,11 @@ namespace KeeperForge2::Render {
 					return true;
 				}
 
-				std::uint32_t CreateTexture(std::uint32_t width, std::uint32_t height) override {
+				std::uint32_t CreateTexture(std::uint32_t width, std::uint32_t height, std::uint32_t levels = 1) override {
 					D3D11_TEXTURE2D_DESC description{};
 					description.Width = width;
 					description.Height = height;
-					description.MipLevels = 1;
+					description.MipLevels = levels < 1 ? 1 : levels;
 					description.ArraySize = 1;
 					description.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
 					description.SampleDesc.Count = 1;
@@ -199,10 +204,11 @@ namespace KeeperForge2::Render {
 					textures[handle] = std::move(entry);
 					return handle;
 				}
-				void UpdateTexture(std::uint32_t texture, const void* pixels, std::uint32_t pitch) override {
+				void UpdateTexture(std::uint32_t texture, const void* pixels, std::uint32_t pitch, std::uint32_t level = 0) override {
 					const auto found = textures.find(texture);
 					if (found == textures.end()) return;
-					context->UpdateSubresource(found->second.texture.Get(), 0, nullptr, pixels, pitch, 0);
+					// One texture, so a mip level's subresource is its level.
+					context->UpdateSubresource(found->second.texture.Get(), level, nullptr, pixels, pitch, 0);
 				}
 				void DestroyTexture(std::uint32_t texture) override { textures.erase(texture); }
 				void CopyFrameToTexture(std::uint32_t texture, std::uint32_t x, std::uint32_t y, std::uint32_t width, std::uint32_t height, std::uint32_t toX, std::uint32_t toY) override {
@@ -331,6 +337,56 @@ namespace KeeperForge2::Render {
 					if (msaaView) frameUnresolved = true;
 				}
 
+				// ---- The ray tracer (RayScene.h, RayHlsl.h, docs/game/ray-tracing.md): the trace and blur compute passes,
+				// the scene in dynamic structured buffers, the per-pixel buffers, and the result textures turned into RGBA
+				// pictures the compute pass writes (DirectX 11 cannot copy a buffer into a texture).
+				bool CanRayTrace() const override { return !rayFailed; }
+				bool TraceAmbientOcclusion(const RaySceneData& scene, const RayTraceSettings& settings, std::uint32_t texture, std::uint32_t reflectionTexture,
+					std::uint32_t bounceTexture) override {
+					if (rayFailed || scene.nodeCount == 0 || settings.width == 0 || settings.height == 0 || !frameShaderView) return false;
+					if (!rayReady && !MakeRayObjects()) {
+						rayFailed = true;
+						return false;
+					}
+					ID3D11UnorderedAccessView* result = RayWritable(texture, settings.width, settings.height);
+					if (!result || !MakeRayBuffers(settings.width, settings.height)) return false;
+					ID3D11UnorderedAccessView* reflections = reflectionTexture ? RayWritable(reflectionTexture, settings.width, settings.height) : rayScratchWritable.Get();
+					ID3D11UnorderedAccessView* bounce = bounceTexture ? RayWritable(bounceTexture, settings.width, settings.height) : rayScratchWritable.Get();
+					if (!reflections || !bounce) return false;
+					if (!Fill(rayNodes, rayNodeView, rayNodeCapacity, scene.nodes, static_cast<UINT>(scene.nodeCount * sizeof(RayNode)))
+						|| !Fill(rayTriangles, rayTriangleView, rayTriangleCapacity, scene.triangles, static_cast<UINT>(scene.triangleCount * sizeof(RayTriangle)))
+						|| !Fill(rayLights, rayLightView, rayLightCapacity, scene.lights, static_cast<UINT>(scene.lightCount * sizeof(RayLight)))) {
+						return false;
+					}
+					D3D11_MAPPED_SUBRESOURCE mapped{};
+					if (FAILED(context->Map(rayConstants.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) return false;
+					std::memcpy(mapped.pData, &settings, sizeof(settings));
+					context->Unmap(rayConstants.Get(), 0);
+
+					// The frame is read for reflections and bounce light: resolved (MSAA), and not bound as a target meanwhile.
+					Resolve();
+					context->OMSetRenderTargets(0, nullptr, nullptr);
+					ID3D11ShaderResourceView* inputs[4] = { rayNodeView.Get(), rayTriangleView.Get(), rayLightView.Get(), frameShaderView.Get() };
+					ID3D11UnorderedAccessView* outputs[5] = { rayRawWritable.Get(), reflections, rayBounceRawWritable.Get(), result, bounce };
+					context->CSSetConstantBuffers(0, 1, rayConstants.GetAddressOf());
+					context->CSSetShaderResources(0, 4, inputs);
+					context->CSSetUnorderedAccessViews(0, 5, outputs, nullptr);
+					context->CSSetSamplers(0, 1, raySampler.GetAddressOf());
+					const UINT groupsX = (settings.width + 7) / 8;
+					const UINT groupsY = (settings.height + 7) / 8;
+					context->CSSetShader(rayTrace.Get(), nullptr, 0);
+					context->Dispatch(groupsX, groupsY, 1);
+					context->CSSetShader(rayBlur.Get(), nullptr, 0);
+					context->Dispatch(groupsX, groupsY, 1);
+					// Unbound again, so the textures can be drawn from and the frame drawn into.
+					ID3D11ShaderResourceView* noInputs[4]{};
+					ID3D11UnorderedAccessView* noOutputs[5]{};
+					context->CSSetShaderResources(0, 4, noInputs);
+					context->CSSetUnorderedAccessViews(0, 5, noOutputs, nullptr);
+					context->CSSetShader(nullptr, nullptr, 0);
+					return true;
+				}
+
 				void UploadScreen(const void* pixels, std::uint32_t width, std::uint32_t height, std::uint32_t pitch) override {
 					if (!screenTexture || width != screenWidth || height != screenHeight) {
 						screenTexture.Reset();
@@ -402,9 +458,148 @@ namespace KeeperForge2::Render {
 				}
 
 			private:
+				// ---- The ray tracer.
+				bool rayReady = false;
+				bool rayFailed = false;
+				ComPtr<ID3D11ComputeShader> rayTrace;
+				ComPtr<ID3D11ComputeShader> rayBlur;
+				ComPtr<ID3D11Buffer> rayConstants;
+				ComPtr<ID3D11SamplerState> raySampler;
+				ComPtr<ID3D11Buffer> rayNodes;
+				ComPtr<ID3D11Buffer> rayTriangles;
+				ComPtr<ID3D11Buffer> rayLights;
+				ComPtr<ID3D11ShaderResourceView> rayNodeView;
+				ComPtr<ID3D11ShaderResourceView> rayTriangleView;
+				ComPtr<ID3D11ShaderResourceView> rayLightView;
+				UINT rayNodeCapacity = 0;
+				UINT rayTriangleCapacity = 0;
+				UINT rayLightCapacity = 0;
+				ComPtr<ID3D11Buffer> rayRaw;
+				ComPtr<ID3D11Buffer> rayBounceRaw;
+				ComPtr<ID3D11UnorderedAccessView> rayRawWritable;
+				ComPtr<ID3D11UnorderedAccessView> rayBounceRawWritable;
+				// Written when a result is not wanted (a texture of 0).
+				ComPtr<ID3D11Texture2D> rayScratch;
+				ComPtr<ID3D11UnorderedAccessView> rayScratchWritable;
+				std::uint32_t rayWidth = 0;
+				std::uint32_t rayHeight = 0;
+				bool MakeRayObjects() {
+					ComPtr<ID3DBlob> trace;
+					ComPtr<ID3DBlob> blur;
+					if (!CompileHlsl(Shaders::RayHlsl, "TraceMain", "cs_5_0", trace) || !CompileHlsl(Shaders::RayHlsl, "BlurMain", "cs_5_0", blur)) {
+						Logger::Warning("Ray tracing: DirectX 11 could not compile the tracer's shaders; ray tracing is off.");
+						return false;
+					}
+					D3D11_BUFFER_DESC constants{};
+					constants.ByteWidth = sizeof(RayTraceSettings);
+					constants.Usage = D3D11_USAGE_DYNAMIC;
+					constants.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+					constants.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+					D3D11_SAMPLER_DESC sampler{};
+					sampler.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+					sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+					sampler.ComparisonFunc = D3D11_COMPARISON_NEVER;
+					sampler.MaxLOD = D3D11_FLOAT32_MAX;
+					if (FAILED(device->CreateComputeShader(trace->GetBufferPointer(), trace->GetBufferSize(), nullptr, &rayTrace))
+						|| FAILED(device->CreateComputeShader(blur->GetBufferPointer(), blur->GetBufferSize(), nullptr, &rayBlur))
+						|| FAILED(device->CreateBuffer(&constants, nullptr, &rayConstants)) || FAILED(device->CreateSamplerState(&sampler, &raySampler))) {
+						Logger::Warning("Ray tracing: DirectX 11 could not make the tracer's objects; ray tracing is off.");
+						return false;
+					}
+					rayReady = true;
+					Logger::Info("Ray tracing: DirectX 11's tracer is ready (compute shaders).");
+					return true;
+				}
+				// A structured buffer of float4 for the shaders to read, filled from memory (made bigger when needed).
+				bool Fill(ComPtr<ID3D11Buffer>& buffer, ComPtr<ID3D11ShaderResourceView>& view, UINT& capacity, const void* data, UINT bytes) {
+					const UINT wanted = (std::max)(bytes, 64u);
+					if (!buffer || capacity < wanted) {
+						buffer.Reset();
+						view.Reset();
+						capacity = 0;
+						D3D11_BUFFER_DESC description{};
+						description.ByteWidth = (wanted + wanted / 2 + 15) / 16 * 16;
+						description.Usage = D3D11_USAGE_DYNAMIC;
+						description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+						description.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+						description.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+						description.StructureByteStride = 16;
+						if (FAILED(device->CreateBuffer(&description, nullptr, &buffer)) || FAILED(device->CreateShaderResourceView(buffer.Get(), nullptr, &view))) return false;
+						capacity = description.ByteWidth;
+					}
+					D3D11_MAPPED_SUBRESOURCE mapped{};
+					if (FAILED(context->Map(buffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) return false;
+					std::memset(mapped.pData, 0, capacity);
+					if (data && bytes > 0) std::memcpy(mapped.pData, data, bytes);
+					context->Unmap(buffer.Get(), 0);
+					return true;
+				}
+				// A per-pixel structured buffer the compute passes read and write.
+				bool MakeWritableBuffer(ComPtr<ID3D11Buffer>& buffer, ComPtr<ID3D11UnorderedAccessView>& view, UINT count, UINT stride) {
+					D3D11_BUFFER_DESC description{};
+					description.ByteWidth = count * stride;
+					description.Usage = D3D11_USAGE_DEFAULT;
+					description.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+					description.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+					description.StructureByteStride = stride;
+					return SUCCEEDED(device->CreateBuffer(&description, nullptr, &buffer)) && SUCCEEDED(device->CreateUnorderedAccessView(buffer.Get(), nullptr, &view));
+				}
+				ComPtr<ID3D11Texture2D> MakeWritablePicture(std::uint32_t width, std::uint32_t height, ComPtr<ID3D11UnorderedAccessView>& writable, ComPtr<ID3D11ShaderResourceView>* view) {
+					D3D11_TEXTURE2D_DESC description{};
+					description.Width = width;
+					description.Height = height;
+					description.MipLevels = 1;
+					description.ArraySize = 1;
+					description.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+					description.SampleDesc.Count = 1;
+					description.Usage = D3D11_USAGE_DEFAULT;
+					description.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+					ComPtr<ID3D11Texture2D> picture;
+					if (FAILED(device->CreateTexture2D(&description, nullptr, &picture)) || FAILED(device->CreateUnorderedAccessView(picture.Get(), nullptr, &writable))) return {};
+					if (view && FAILED(device->CreateShaderResourceView(picture.Get(), nullptr, view->ReleaseAndGetAddressOf()))) return {};
+					return picture;
+				}
+				bool MakeRayBuffers(std::uint32_t width, std::uint32_t height) {
+					if (width == rayWidth && height == rayHeight && rayRaw && rayBounceRaw && rayScratch) return true;
+					rayRaw.Reset();
+					rayBounceRaw.Reset();
+					rayRawWritable.Reset();
+					rayBounceRawWritable.Reset();
+					rayScratchWritable.Reset();
+					rayWidth = rayHeight = 0;
+					const UINT pixels = width * height;
+					rayScratch = MakeWritablePicture(width, height, rayScratchWritable, nullptr);
+					if (!rayScratch || !MakeWritableBuffer(rayRaw, rayRawWritable, pixels, 8) || !MakeWritableBuffer(rayBounceRaw, rayBounceRawWritable, pixels, 16)) {
+						Logger::Warning("Ray tracing: DirectX 11 could not make the tracer's buffers for " + std::to_string(width) + "x" + std::to_string(height) + ".");
+						rayRaw.Reset();
+						return false;
+					}
+					rayWidth = width;
+					rayHeight = height;
+					return true;
+				}
+				// The texture behind a handle, turned (once) into a picture the compute pass can write; its view for drawing
+				// is replaced with the new picture's.
+				ID3D11UnorderedAccessView* RayWritable(std::uint32_t handle, std::uint32_t width, std::uint32_t height) {
+					const auto found = textures.find(handle);
+					if (found == textures.end()) return nullptr;
+					TextureEntry& entry = found->second;
+					if (!entry.writable) {
+						ComPtr<ID3D11UnorderedAccessView> writable;
+						ComPtr<ID3D11ShaderResourceView> view;
+						ComPtr<ID3D11Texture2D> picture = MakeWritablePicture(width, height, writable, &view);
+						if (!picture) return nullptr;
+						entry.texture = picture;
+						entry.view = view;
+						entry.writable = writable;
+					}
+					return entry.writable.Get();
+				}
 				struct TextureEntry {
 					ComPtr<ID3D11Texture2D> texture;
 					ComPtr<ID3D11ShaderResourceView> view;
+					// The ray tracer's results: an RGBA picture its compute pass writes (none for other textures).
+					ComPtr<ID3D11UnorderedAccessView> writable;
 				};
 				HWND window = nullptr;
 				int reportedStatus = 0;
@@ -792,6 +987,11 @@ namespace KeeperForge2::Render {
 					if (!made) {
 						D3D11_SAMPLER_DESC description{};
 						description.Filter = state.linear ? D3D11_FILTER_MIN_MAG_MIP_LINEAR : D3D11_FILTER_MIN_MAG_MIP_POINT;
+						// texture_filtering: anisotropic for the linear ones (the game's 3D textures).
+						if (state.linear && anisotropy > 1) {
+							description.Filter = D3D11_FILTER_ANISOTROPIC;
+							description.MaxAnisotropy = anisotropy;
+						}
 						// D3DTEXTUREADDRESS and D3D11_TEXTURE_ADDRESS_MODE number the same way.
 						description.AddressU = static_cast<D3D11_TEXTURE_ADDRESS_MODE>(state.addressU);
 						description.AddressV = static_cast<D3D11_TEXTURE_ADDRESS_MODE>(state.addressV);

@@ -11,6 +11,13 @@ namespace KeeperForge2 {
 		constexpr double OriginalFocal = 320.0;
 		constexpr double OriginalHeight = 480.0;
 		std::uint32_t fieldOfView = 100;
+		double setFocal = 0.0;
+		double setHeight = 0.0;
+	}
+
+	float WidescreenCamera::FocalLength(std::uint32_t height) {
+		if (setHeight <= 0.0 || height == 0) return static_cast<float>(OriginalFocal);
+		return static_cast<float>(setFocal * height / setHeight);
 	}
 
 	void WidescreenCamera::Install(std::uint32_t fieldOfViewPercent) {
@@ -28,6 +35,8 @@ namespace KeeperForge2 {
 		const auto fixed = static_cast<std::int32_t>(std::lround(focal * 4096.0));
 		Memory::Write<std::int32_t>(Game::Resolve(Game::Address::PlayerCameraFocal) + 4, fixed);
 		Memory::Write<std::int32_t>(Game::Resolve(Game::Address::PathCameraFocal) + 4, fixed);
+		setFocal = focal;
+		setHeight = height;
 		Logger::Debug("Widescreen: camera focal length " + std::to_string(focal) + " for a " + std::to_string(height) + " pixel tall screen.");
 	}
 }

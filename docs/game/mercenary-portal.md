@@ -178,6 +178,16 @@ mechanism, cause inferred]
   - adds the ten heroes to the lobby's list (after the record callback,
     when the game did not add them);
   - sets their count to 16 when the list is made;
+  - [verified] Choosing a map sets the list's numbers from the level files:
+    0x53F150 (thiscall (front end; map name, flag) ret 8). With flag 0 it sets
+    every row to 0 (0x5488A0) and reads GlobalVariables.kwd. Otherwise it reads
+    the map's own file. Their creature pool entries set the rows of their types
+    (0x53F600, 0x548E70). The 16 from when the list was made does not survive
+    this.
+  - [tested] The level files give the Stone Knight none (it is no keeper
+    creature), so it never came: the portal's log said "none left in the
+    creature list" all game. After 0x53F150, a Stone Knight row left at 0 gets
+    16 while Stone Knights are on (hooked in MercenaryPortal).
   - for heroes, uses the pool's number as "how many alive at a time".
     The first time a keeper's portal runs in a level, its numbers are
     kept as limits. For each portal choice, the pool is set to the limit

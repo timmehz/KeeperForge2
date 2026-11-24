@@ -13,6 +13,9 @@ namespace KeeperForge2 {
 			static void Install();
 			// True when one of our renderers draws the game.
 			static bool IsActive();
+			// True once Install has pointed the game at our DirectDraw, before the game has made it (IsActive turns true
+			// only then). Our DirectDraw is what watches the game's window (its messages), so this is known early.
+			static bool IsChosen();
 			// Videos: stretch the picture over the whole window instead of keeping its shape.
 			static void SetStretch(bool stretch);
 			// Videos: where the film is on the screen (in screen pixels) and the film's own shape (width / height).

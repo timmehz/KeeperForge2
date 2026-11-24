@@ -1,5 +1,6 @@
 #include "ModData.h"
 #include "CreatureRegistry.h"
+#include "CustomCampaign.h"
 #include "Config.h"
 #include "GameAddresses.h"
 #include "HookManager.h"
@@ -206,6 +207,8 @@ namespace KeeperForge2 {
 					Logger::Debug("Mod data: " + std::string(path) + " is read from " + candidate.string() + " (first time a file is taken from a mod or pack).");
 				}
 			}
+			// A custom campaign's level being played: its files from the campaign's folder.
+			if (const auto campaignFile = CustomCampaign::LevelFileFor(source); !campaignFile.empty()) source = campaignFile;
 			// A level's own creature list (wherever the level is, KeeperForge2\maps included): with the mods' types added.
 			if (const auto levelList = CreatureRegistry::LevelListFor(source); !levelList.empty()) source = levelList;
 			if (source == fs::path(path)) return originalOpenByPath(status, file, path, access);

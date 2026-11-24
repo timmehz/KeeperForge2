@@ -1,8 +1,9 @@
 # Steam multiplayer (SteamMultiplayer.cpp)
 
 Multiplayer with Steam friends through the game's own TCP/IP screens. Dungeon
-Keeper 2 on Steam is app 2616460; the game does not ship steam_api.dll, so the
-player puts a 32-bit one in the game folder or the KeeperForge2 folder.
+Keeper 2 on Steam is app 2616460; the game does not ship steam_api.dll. KeeperForge2's releases include the 32-bit
+one from the Steamworks SDK's redistributable_bin (Valve lets games ship it); it goes in the game folder or the
+KeeperForge2 folder. The SDK itself stays out of the repository.
 
 ## The game's network library (WEANETR.dll) [verified in our export]
 - Its own service (BullfrogNET in Flame [reference]) is UDP only: socket
@@ -209,7 +210,7 @@ start. If there is none, it shows an error and closes before starting the game.
 - Not tested yet.
 
 ## Use
-- Put steam_api.dll (32-bit, from Steamworks SDK 1.65 or newer) in the game
+- Put steam_api.dll (32-bit, from Steamworks SDK 1.65 or newer; the release has it) in the game
   folder or KeeperForge2, have Steam running, and start the game with the
   launcher. The log says
   "Steam: lobby ready".

@@ -125,6 +125,52 @@ scratch (GameFixes.cpp, CreatureFixes.cpp). Status per fix:
   the chain is put in row order (top to bottom, left to right: what one drag
   builds) first. A room already built keeps its objects until it next changes
   (a tile added or sold).
+- **Chickens hatching outside the Hatchery** [verified code] (written, not
+  tested in game) The Hatchery lays an egg (object type 0x2F) on a random pen
+  (0x4DE620, from the room's tick 0x4DE0A0), 0x800 above the floor, in object
+  state 0x18 (0x4A21C0). That state destroys the egg if it is not on a pen
+  tile (0x4DEA50). At 4 seconds old it throws the egg off the pen, at the
+  pen's facing give or take a random 0x80 (speed 0x6000 across, 0x3000 up).
+  Once its speed drops below 0x1000 the egg goes to state 0x20 (0x4A1CF0).
+  That state makes a chicken (type 9) at the egg's position with the egg's
+  owner, and nothing checks the egg is still in the room. A throw from a pen
+  near the room's edge, or a bounce, could leave it outside, so the chicken
+  came out there. Fix: the egg stops at the room's edge. 0x4A21C0 is hooked,
+  and after each of its turns (while the egg sits and while it rolls) an egg
+  that is not on a tile of a Hatchery its owner owns is moved (0x4B5560, which
+  relinks it into the tile's list) to the nearest point inside such a tile
+  within 5 tiles, an eighth of a tile in from its edge. It is never put below
+  that tile's floor (0x4545C0). Its speed across (+ 0x104, + 0x108) is set to
+  0, and its upward speed (+ 0x10C) is kept. The game's own speed check then
+  hatches it there. 0x4A1CF0 is hooked too and does the same check once more
+  just before the chicken is made. Ties go to the first tile in row order.
+  If there is none (the room was sold meanwhile), the game's own behavior is
+  kept. The fix only reads game state, so multiplayer stays in step. Our own
+  find, not from Flame/Ember.
+- **Chickens walking out of the Hatchery** [verified code] (written, not
+  tested in game) [user: a bunch walked out of the Hatchery] An object's turn
+  (0x49BD20, object vtable + 0x14) runs its state (0x49EED0) and then moves it
+  (0x4B2030). A chicken's wander state (0x4A24A0) turns it at random (0x4B2C10)
+  and looks at the room under it only when its walk ends (its own Hatchery:
+  state 6, a Prison: 3, elsewhere: 0xA), so nothing kept it on the room's
+  tiles while it walked. Fix: 0x49BD20 is hooked; a chicken that starts its
+  turn on a Hatchery tile of its owner and ends it off one is put back where
+  it was (0x4B5560), its speed across set to 0 and its heading (+ 0xF4) turned
+  half round. Chickens already outside are left alone. Our own find.
+- **Videos frozen after switching away** [verified code] (written, not tested
+  in game) While a video plays, PlayMovie (0x53BCD0) adds 0x53C2E0 to the game's
+  focus handlers (list at 0x757D71). 0x558C70 calls them on WM_ACTIVATE,
+  WM_ACTIVATEAPP and WM_NCACTIVATE, with event 0 when focus comes (low word of
+  wParam not 0) and 1 when it goes; 2 is a screen mode change. The video's
+  handler swapped the player between playing and paused (0x5A8FF0: state at
+  player + 0x9C, 3 and 4, and its sound buffer) on 0 and 1 alike, so only an even
+  count kept it playing. Windows does not always send the same set (minimize and
+  restore, clicking back in), and background running hands the held focus-loss
+  messages over only as focus comes back, so a video could stay paused on its
+  last frame for good. Fix: 0x53C2E0 is hooked; on 0 it plays the video (player
+  at 0x73F594) and on 1 pauses it, each only when it is not so already and only
+  between those two states; any other event goes to the game's handler. Our own
+  find, not from Flame/Ember.
 - **Portal creatures missing from a level's pool** (CreatureFixes; written,
   not tested in game) A portal only brings a type whose pool number is above
   0 (0x506400). The pool (player + 0x1109) holds one entry per creature type
@@ -227,34 +273,172 @@ scratch (GameFixes.cpp, CreatureFixes.cpp). Status per fix:
   [reference: Flame fix_keyboard_state_on_alt_tab] The crash on switching
   away in multiplayer was the old display's lost surfaces, covered by our
   renderer (see Covered).
+- **Hero party spawn at the creature limit** [verified code] (written, not
+  tested in game) The hero party trigger action (type 0xE) runs 0x519F90
+  (thiscall (world, party index, action point, invasion flag) ret 0xC). It
+  makes up to 16 members one by one through 0x519B20, which returns 0 when no
+  creature can be made (the world is full). On 0 it returned at once
+  (0x51A274 to 0x51A756), so the members already made never got their leader
+  links, speed or party count. The finish code after the loop (0x51A5E2) finds
+  the leader (creature + 0x46F bit 2) and uses it twice: an effect at its
+  position (0x51A66A, through thing 0 when there is none) and its place in the
+  party (0x51A73A, writing through a null pointer when there is none). Fixed:
+  a failed member jumps to the finish code, and both leader uses are skipped
+  when no leader was made, so the spawn returns 1 with a smaller party.
+  Followers of a leaderless party get leader tag 0, as in Flame [unverified:
+  how they behave]. [reference: Flame hero_party_spawn_limit_fix]
+- **Missing picture** [verified code] (written, not tested in game)
+  0x59A4B0 (cdecl (name)) loads a PNG through the bridge object's method
+  + 0x11C and returns a 40-byte picture record (four color masks, bits per
+  pixel, a bytes-per-pixel flag, pixels, width, height, row pitch), or 0 when
+  the file is missing. Its only caller (0x5912D3) reads the width and height
+  from it at once and copies its pixels (0x5914E0), so a missing file crashed
+  the game; the record is not freed there. Fixed: 0x59A4B0 is hooked and
+  returns a shared 64x64, 32-bit placeholder (dark gray and purple squares)
+  instead of 0, with a warning in the log naming the file.
+  [reference: Flame null_surf_fix]
+- **Room tile with no room** [verified code] (written, not tested in game)
+  0x443610 (thiscall (bridge, x, y, tile, terrain data, mesh arrays) ret
+  0x14, called at 0x43E3E0 for room terrain) builds a room tile's meshes. It
+  takes the tile's room like 0x4559B0 does (ThingTable[(tile + 2) & 0xFFF])
+  and reads the room's data (+ 0x19) without a check, so a tile marked as room
+  terrain with no room crashed the game when drawn. This may be where the
+  roomless tiles from the room limit (above) crashed [unverified]. Fixed:
+  hooked; a tile with no room draws no room meshes. [reference: Flame
+  CBridge room check]
+- **Long save path** [verified code] (written, not tested in game) Loading a
+  saved game (in the game component's loop 0x525370, 0x52555E..0x5255AF)
+  copies the save's name (wide, game config 0x75AD47 + 0x90) into a
+  64-character buffer, turns it into the code page's text in a 64-byte one
+  (0x5557E0, WideCharToMultiByte), then writes "%s%s" of the saves folder
+  (0x758754: the game's folder followed by data\Save\ [reference: Flame]) and
+  that name into a 64-byte buffer ([esp + 0x114])
+  with no limit, and hands that to the save loader (0x50E920, at 0x5255CD).
+  A Steam install's saves folder alone is close to 64 characters, so the path
+  ran into the buffers after it, and past about 190 characters into the
+  function's exception frame. Nothing else in the function reads those
+  buffers. Fixed: the block jumps to a stub that builds the path (same code
+  page conversion) into a 1024-byte buffer of ours, logging when it is cut,
+  and the loader is given that buffer. [reference: Flame buffer_overrun_fix,
+  save path part]
+- **Sound thread stop wait** [verified code] (written, not tested in game)
+  Stopping the sound list thread (0x60D630, called from its destructor
+  0x60D5C0; thiscall (thread object)) sets + 0x39 (exit) and + 0x3C (wake,
+  InterlockedExchange), then waits for + 0x38 (stopped) at 0x60D64A in a loop
+  that never gives up the processor. With the game's threads on one processor
+  (patch.dll, see cpu-threads.md) that loop can keep the sound thread from
+  running, hanging the game as it closes [unverified: seen]. Fixed: the 14
+  bytes jump to a stub that calls SwitchToThread on each pass.
+  [reference: Flame while_without_syscall_fix, sound thread part]
+- **Closing the window during a game** [verified code] (written, not tested
+  in game) The game's window procedure (0x5B5070) answers WM_CLOSE (Alt+F4,
+  the close button) by calling 0x5B2E50(1), the quit flag, so a running game
+  dropped out mid-level without its own exit. The in-game "exit to Windows"
+  confirmation (0x4205B0, raw bytes in our export) instead sends an action of
+  kind 0x7D with the interface's player tag (+ 8) at + 0x10, through the
+  interface's push 0x4346E0 (thiscall (interface, action) ret 4: counts it at
+  + 0xA, sends it through the session at + 4 with 0x527130). Fixed: our
+  window procedure (DirectDrawLayer) sends that same action when the
+  interface's session is set (a game is running) and does not pass WM_CLOSE
+  on; in the menus the game closes as before.
+  [reference: Flame fix_close_window]
+- **Host port box** [verified code] (written, not tested in game) A text
+  input's configure (0x52AA10, thiscall (button, config) ret 4) sets its
+  limit (button + 0x280) from the config's + 0x1A (11 or 16 by keyboard layout
+  when that is -1). Typing (0x52C40E) takes a character only while the length
+  (+ 0x1DC of the edit state) is below limit - 1, so the limit counts the
+  closing 0. The TCP/IP menu's port box (button id 0x212, + 0x74) has a limit
+  of 5 [reference: Flame menu data], so a 5-digit port could not be typed.
+  Fixed: 0x52AA10 is hooked; after it, the port box's limit gets one more.
+  [reference: Flame max_host_port_number_fix]
+- **Why a game cannot be joined** [verified code] (written, not tested in
+  game) The multiplayer session list (0x54D370, raw bytes in our export,
+  disassembled with ml + dumpbin) walks the found sessions (count 0x73FE74,
+  array 0x73FE78, 0xA4 bytes each: + 0 version as major << 16 | minor, + 0x28
+  players, + 0x40 map info (+ 0x40 bits 0..6 computer players, + 0x41 name
+  length, + 0x42 the map's players, + 0x44 name hash, + 0x48 file check),
+  + 0x64 name). Each line is name, "#players / max#", map name and
+  "#major.minor", then a separator. A session is joinable (front end + 0x602B
+  + index) when players < max, its version equals ours (0x6BC430, 0x6BC434),
+  its file check equals ours (0x7962A0) and max > 1; the map lookup (0x53ED60,
+  1 found, else the "unknown map" text) does not count. Nothing told the
+  player why a game was greyed out. Fixed (two stubs in 0x54D370): after the
+  version text is made (0x54D548), "#reason" is added to it (map not found,
+  game is full, version x.y, different game files, one player map; the
+  game's order, last wins), so it is counted in the line's size; after the
+  joinable byte (0x54D58C) a session whose map is missing is made not
+  joinable, as Flame does. [unverified: how the list shows the line's fifth
+  field] [reference: Flame display_incompatible_reason]
+- **Start-up errors** [verified code] (written, not tested in game) The
+  game's start-up (0x5A5DA0, cdecl (argc, argv), called once at 0x64780B)
+  makes the mutex "DKII MUTEX" (0x5BAE70: CreateMutexA; byte + 0 set on
+  ERROR_ALREADY_EXISTS) and stops at once when another copy has it. Then
+  each of these calls ends it with no message when it returns 0: the command
+  line (0x5A63B0 at 0x5A5FAC), fonts and texts (0x552F10 at 0x5A5FBC), the
+  window (0x557CB0 at 0x5A60DB), speech (0x567F90 at 0x5A6187, with sound
+  only), the network library (0x559BE0 at 0x5A6199), the Windows check
+  (0x557FB0 at 0x5A61D0) and the components (0x552BE0 at 0x5A61F8). Fixed:
+  each of those calls goes to a wrapper that logs the first failing step
+  (ErrorAndContinue); the start-up's own call goes to a wrapper that checks
+  for the mutex first and, after the start-up, shows a message box: "already
+  running", or which step failed. Only works when the launcher starts the
+  runtime before the game's code. patch.dll sends the command line call
+  (rel32 at 0x5A5FAD) to its own parser [verified in our patch.dll export
+  and in game: the first build refused it as "unexpected game code"], so a
+  step's call is only required to be a "call rel32" and its wrapper calls
+  whatever it led to. [reference: Flame print_game_start_errors,
+  notify_another_instance_is_running]
+- **Windows version check** [verified code] (written, not tested in game)
+  The start-up's Windows check (0x557FB0) is "push 0; push 0; push 6; call
+  0x557FD0; neg eax; sbb eax, eax; inc eax": it passes only when Windows is
+  NOT at least 6.0 (0x557FD0, stdcall (major, minor, service pack), compares
+  with GetVersionExA). So the game only started on Windows before Vista,
+  unless Windows reported an older version to it [unverified: what does that
+  on current installs; patch.dll does not]. Fixed: the "push 6" (0x557FB4)
+  becomes "push 11"; Windows 11 still reports 10.0, so every current Windows
+  passes. [reference: Flame modern_windows_support]
+- **Computer player stuck on one creature** [verified code] (written, not
+  tested in game) In the threat response (0x4FE0B0), each pass picks the
+  first creature of the keeper's list (keeper at computer player + 0xE,
+  creature count at keeper + 0x16) that passes its tests; every test that
+  fails goes to 0x4FE50D, the last one ("not a worker", 0x4FE504) picks it
+  (0x4FE522). Then 0x48E6A0 (creature, keeper tag) says whether it is the
+  keeper's; when not (0x4FE544 to 0x4FE914) nothing is dropped, and the next
+  pass picks the same creature again, so the computer can spend its whole
+  response on it. Fixed: such a creature gets a penalty of (creatures owned
+  - 1); each later pick skips it and counts it down (kept to at most
+  creatures owned - 1). Kept by creature tag in our own table, cleared at
+  each level start (SessionOptions' level start, from the world's set-up)
+  [unverified: whether that also runs when a saved game is loaded].
+  [reference: Flame blocking_response_to_threat_fix]
+- **King and Stone Knight show nothing in the hand** [verified: stock
+  Creatures.kwd; code] (written, not tested in game; our own find) In the
+  stock creature list, animation 11 (In Hand, record + 0x20 + 0x54 * 11) is
+  empty for King Reginald (21) and the Stone Knight (28); every other hero
+  has a "-Swing" mesh there. Nobody could pick them up before, but with the
+  Mercenary Portal a keeper can own one, and the hand then showed nothing
+  (seen in game with the King). Fixed: the record converter 0x568E30
+  (thiscall (type, record) ret 4, its one caller the list reader at
+  0x56A41A) is hooked; a record with an empty In Hand animation gets its
+  Stunned pose (animation 10, "King-Stunned_pose") copied there before it
+  is converted. Works for the shared list and levels' own lists.
+- **Title screen wait** [verified code] (written, not tested in game) The
+  title screen (0x5340F0) shows "TitleScreen\TitleScreen" and then waits
+  10 seconds (0x5341D8..0x5341F6: the game's millisecond clock 0x5B5E90 + 10000,
+  then a loop that only reads the clock again, no messages, no sleep).
+  Changed: the loop jumps to a stub that waits `title_screen_ms`
+  (config.yml, default 600, Flame's) sleeping between checks, and Space,
+  Escape, Enter or a left click ends it; after a skip it waits (at most 1 s)
+  for the key to be let go, so the click does not land on the main menu.
+  [reference: Flame skippable_title_screen]
 
 ## Todo (facts from the references, to verify)
-- **Hero party spawn limit crash** [reference] The trigger that spawns a
-  hero party: if making a creature fails (the world's 448 creature limit),
-  it returned early, and when no leader was made the party finish code used
-  a null leader. Flame finishes the party with what was made and skips the
-  leader step when there is none. Likely more common with many Dwarfs.
-  Flame: CWorld spawnWholeParty / finalizeSpawnParty.
-- **Missing PNG** [reference] 0x59A4B0 can return no surface for a missing
-  PNG, which crashes users; Flame substitutes a placeholder texture.
-- **Host port field** [reference] The port number text input (button id
-  0x212, configured in 0x52AA10) allows one character too few for a 5-digit
-  port.
-- **Sound thread stop spin** [reference] A sound thread destructor waits in
-  a loop without yielding (Flame MySnd_ListThread::destructor).
-- **Save path buffer overrun** [reference] Flame CGameComponent: building
-  the save file path from a long name overflows a 64-byte buffer.
-- **Closing the window** [reference] WM_CLOSE during a game should go
-  through the game's exit action instead of ending abruptly.
 - **Ember: uninitialized structure** [reference] Ember
   fix_usage_unitialized_structure.cpp (to read).
 - **Ember: relative mouse data** [reference] Ember mouse_dinput
   fix_relative_mouse_data.cpp (to read).
 - **Multiple network interfaces** [reference] LAN games pick the wrong
   local address with several network adapters (Flame multi_interface_fix).
-- **Blocking threat response** [reference] Flame keeps a per-creature
-  penalty so the computer does not keep picking a creature it cannot drop;
-  needs extra creature data (maybe later).
 - **Movie clip icons (All Change, Chicken and Hyde swapped)** [verified
   mechanism] The Movies menu's clips come from a table at 0x6B0DD0: 22
   entries of 9 bytes { clip number, title text id (int), unlocked (int) }.
@@ -298,8 +482,10 @@ scratch (GameFixes.cpp, CreatureFixes.cpp). Status per fix:
   0x47E0C0) only waits and calls 0x478B80(5, ..., 9); creatures with bit
   0x8000 count as not attackable in 0x45A8B0, so pit fights are paired
   somewhere else. A neutral creature dropped in a Prison becomes the room
-  owner's (0x473920). Not found yet: where pit fighters are paired and why a
-  neutral one does not hit back.
+  owner's (0x473920). Pairing found since [verified]: state 0x8A (0x457B40)
+  asks the room for an opponent (0x4D8100) and gives each the other as attack
+  target (0x48F390), see possession.md. Not found yet: why a neutral one does
+  not hit back.
 - Combat Pit log (CombatPitLog.cpp, log_level debug or trace only): hooks the
   state setter (0x476D30, thiscall (state block, state, value) ret 8; the
   block's + 8 is its creature) and the melee hit (0x498E30, thiscall

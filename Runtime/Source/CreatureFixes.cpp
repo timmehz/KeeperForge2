@@ -310,6 +310,181 @@ namespace KeeperForge2 {
 		bool LevelSetsPools() {
 			return Memory::Read<std::int32_t>(Game::Resolve(Game::Address::PlayMode)) == Game::PlayModeCampaign || CoopCampaign::InSession();
 		}
+		// ---- Creatures with no bed. A creature type's bed is the object in its creature data + 0x771 (0 = none; the royals,
+		// Imps, Skeletons, Horny). The game's own "go and make a home" choice (0x46F390) checks it, but two Lair state
+		// handlers do not (thiscall (state block), creature at block + 8, returning 0 when there is nothing to do):
+		// 0x46F4F0, in a Lair with no bed of its own, walks to a free spot with arrival 0x50 ("make a home"); 0x46F6B0, that
+		// arrival, makes the bed (0x4E03F0 -> 0x48AD50, which cannot make object 0), and when that fails walks to another
+		// spot with arrival 0x50 again. A creature with no bed went round that for ever. For one, both now do nothing.
+		using StateHandlerFn = std::int32_t(__fastcall*)(std::uint8_t* block);
+		StateHandlerFn originalLairState = nullptr;
+		StateHandlerFn originalMakeHomeArrival = nullptr;
+		bool HasNoBed(const std::uint8_t* block) {
+			if (block == nullptr) return false;
+			const auto* creature = *reinterpret_cast<const std::uint8_t* const*>(block + Game::Offset::StateBlockCreature);
+			if (creature == nullptr) return false;
+			const auto* data = *reinterpret_cast<const std::uint8_t* const*>(creature + Game::Offset::CreatureData);
+			return data != nullptr && data[Game::Offset::CreatureDataLairObject] == 0;
+		}
+		std::int32_t __fastcall LairStateDetour(std::uint8_t* block) {
+			if (HasNoBed(block)) return 0;
+			return originalLairState(block);
+		}
+		std::int32_t __fastcall MakeHomeArrivalDetour(std::uint8_t* block) {
+			if (HasNoBed(block)) return 0;
+			return originalMakeHomeArrival(block);
+		}
+		bool InstallNoBedFix() {
+			const auto lairState = Game::Resolve(Game::Address::LairStateInRoom);
+			const auto arrival = Game::Resolve(Game::Address::MakeHomeArrival);
+			// sub esp, 0xC / push ebx / push esi / mov esi, ecx / push edi
+			// sub esp, 0x1C / push ebx / push ebp / push esi / mov esi, ecx / push edi
+			if (!Memory::Matches(lairState, { 0x83, 0xEC, 0x0C, 0x53, 0x56, 0x8B, 0xF1, 0x57 })
+				|| !Memory::Matches(arrival, { 0x83, 0xEC, 0x1C, 0x53, 0x55, 0x56, 0x8B, 0xF1, 0x57 })) return false;
+			if (!HookManager::CreateHook(lairState, reinterpret_cast<void*>(&LairStateDetour), reinterpret_cast<void**>(&originalLairState))
+				|| !HookManager::CreateHook(arrival, reinterpret_cast<void*>(&MakeHomeArrivalDetour), reinterpret_cast<void**>(&originalMakeHomeArrival))
+				|| !HookManager::EnableHook(lairState) || !HookManager::EnableHook(arrival)) {
+				HookManager::RemoveHook(lairState);
+				HookManager::RemoveHook(arrival);
+				return false;
+			}
+			return true;
+		}
+	}
+
+	namespace {
+		// ---- Payday: a creature goes for its wage to the Treasury or Dungeon Heart nearest in a straight line, walls not
+		// counted, so a Treasury on the far side of a wall beat a Heart a few steps away. The game's own choice is kept
+		// (which rooms count, reachable, with gold), but each room is now measured by the walk there: the game's own path
+		// search, added up along its waypoints. Only game state is used, so every machine chooses the same.
+		using PathFindFn = void(__cdecl*)(std::int32_t* result, std::int32_t startX, std::int32_t startY, std::int32_t endX, std::int32_t endY, std::int32_t mode);
+		constexpr std::size_t PathResultInts = 0x814 / 4;
+		constexpr std::size_t PathCount = 4;
+		constexpr std::size_t PathFirstWaypoint = 5;
+		constexpr std::size_t MostWaypoints = (PathResultInts - PathFirstWaypoint) / 2;
+		constexpr std::int32_t PathRouteMode = -2;
+		// A room that can be reached but has no path the search can give: last choice, before none at all.
+		constexpr std::uint32_t NoPathDistance = 0x7FFFFFFE;
+		std::array<std::int32_t, PathResultInts> pathResult{};
+		std::uint64_t SquareRoot(std::uint64_t value) {
+			std::uint64_t root = 0;
+			std::uint64_t bit = std::uint64_t{ 1 } << 62;
+			while (bit > value) bit >>= 2;
+			while (bit != 0) {
+				if (value >= root + bit) {
+					value -= root + bit;
+					root = (root >> 1) + bit;
+				}
+				else root >>= 1;
+				bit >>= 2;
+			}
+			return root;
+		}
+		std::uint64_t Step(std::int32_t fromX, std::int32_t fromY, std::int32_t toX, std::int32_t toY) {
+			const std::int64_t dx = static_cast<std::int64_t>(toX) - fromX;
+			const std::int64_t dy = static_cast<std::int64_t>(toY) - fromY;
+			return SquareRoot(static_cast<std::uint64_t>(dx * dx + dy * dy));
+		}
+		// Called in place of 0x43C260, thiscall (state block, place) ret 4: the walk's length from the creature to the place.
+		// 0x471630 has just run the same search for this creature and place, so its rules are set and the result is kept.
+		std::uint32_t __fastcall PaydayDistance(const std::uint8_t* block, void*, const std::int32_t* place) {
+			const auto* creature = *reinterpret_cast<const std::uint8_t* const*>(block + 8);
+			const auto x = *reinterpret_cast<const std::int32_t*>(creature + Game::Offset::ThingPositionX) >> 4;
+			const auto y = *reinterpret_cast<const std::int32_t*>(creature + Game::Offset::ThingPositionY) >> 4;
+			const auto endX = place[0] >> 4;
+			const auto endY = place[1] >> 4;
+			pathResult.fill(0);
+			reinterpret_cast<PathFindFn>(Game::Resolve(Game::Address::PathFind))(pathResult.data(), x, y, endX, endY, PathRouteMode);
+			const auto count = pathResult[PathCount];
+			if (count <= 0 || static_cast<std::size_t>(count) > MostWaypoints) return NoPathDistance;
+			std::uint64_t length = 0;
+			std::int32_t fromX = x, fromY = y;
+			for (std::int32_t i = 0; i < count; ++i) {
+				const auto toX = pathResult[PathFirstWaypoint + i * 2];
+				const auto toY = pathResult[PathFirstWaypoint + i * 2 + 1];
+				length += Step(fromX, fromY, toX, toY);
+				fromX = toX;
+				fromY = toY;
+			}
+			length += Step(fromX, fromY, endX, endY);
+			return length < NoPathDistance ? static_cast<std::uint32_t>(length) : NoPathDistance - 1;
+		}
+		// ---- Other "nearest room" choices (GameAddresses.h, NearestRoomDistanceCalls): the same straight-line measure, so
+		// a room behind a wall beat one a short walk away. Each call now gets the walk's length instead, on the game's own
+		// scale (squared / 4096 of 12.12 units), so the code around it compares and keeps it as before. Each of these runs
+		// right after the creature's own reachability check, so the path search's walking rules are that creature's. No
+		// path from these two points: the straight-line distance, as before.
+		std::uint32_t Straight(const std::int32_t* from, const std::int32_t* to) {
+			const std::int64_t dx = static_cast<std::int64_t>(to[0]) - from[0];
+			const std::int64_t dy = static_cast<std::int64_t>(to[1]) - from[1];
+			return static_cast<std::uint32_t>((dx * dx) >> 12) + static_cast<std::uint32_t>((dy * dy) >> 12);
+		}
+		// The walk from one place to another (1/256 tile), or -1 when the search finds no path.
+		std::int64_t WalkLength(std::int32_t x, std::int32_t y, std::int32_t endX, std::int32_t endY) {
+			pathResult.fill(0);
+			reinterpret_cast<PathFindFn>(Game::Resolve(Game::Address::PathFind))(pathResult.data(), x, y, endX, endY, PathRouteMode);
+			const auto count = pathResult[PathCount];
+			if (count <= 0 || static_cast<std::size_t>(count) > MostWaypoints) return -1;
+			std::uint64_t length = 0;
+			std::int32_t fromX = x, fromY = y;
+			for (std::int32_t i = 0; i < count; ++i) {
+				const auto toX = pathResult[PathFirstWaypoint + i * 2];
+				const auto toY = pathResult[PathFirstWaypoint + i * 2 + 1];
+				length += Step(fromX, fromY, toX, toY);
+				fromX = toX;
+				fromY = toY;
+			}
+			length += Step(fromX, fromY, endX, endY);
+			return static_cast<std::int64_t>(length);
+		}
+		// thiscall (from, to) ret 4, as StraightDistance.
+		std::uint32_t __fastcall WalkDistance(const std::int32_t* from, void*, const std::int32_t* to) {
+			const auto length = WalkLength(from[0] >> 4, from[1] >> 4, to[0] >> 4, to[1] >> 4);
+			if (length < 0) return Straight(from, to);
+			// 1/256 tile to the game's measure: (length * 16)² / 4096 = length² / 16.
+			const auto squared = static_cast<std::uint64_t>(length) * static_cast<std::uint64_t>(length) / 16;
+			return squared < 0x7FFFFFFEull ? static_cast<std::uint32_t>(squared) : 0x7FFFFFFEu;
+		}
+		std::vector<std::uint8_t> CallTo(std::uintptr_t at, std::uintptr_t target) {
+			const auto rel = static_cast<std::uint32_t>(target - (at + 5));
+			return { 0xE8, static_cast<std::uint8_t>(rel), static_cast<std::uint8_t>(rel >> 8), static_cast<std::uint8_t>(rel >> 16), static_cast<std::uint8_t>(rel >> 24) };
+		}
+		bool InstallNearestRoomFix() {
+			const auto straight = Game::Resolve(Game::Address::StraightDistance);
+			const auto keep = Game::Resolve(Game::Address::GoldDropKeepBest);
+			const auto next = Game::Resolve(Game::Address::GoldDropLoopNext);
+			const auto rel = static_cast<std::int32_t>(next - (keep + 7));
+			// Every call as expected first, so either all are changed or none.
+			for (const auto address : Game::Address::NearestRoomDistanceCalls) {
+				const auto at = Game::Resolve(address);
+				if (!Memory::Matches(at, CallTo(at, straight))) return false;
+			}
+			// mov ecx, [edi+8]; mov eax, [ebp-0x3C]; add ecx, 0x1A
+			if (!Memory::Matches(keep, { 0x8B, 0x4F, 0x08, 0x8B, 0x45, 0xC4, 0x83, 0xC1, 0x1A }) || rel < -128 || rel > 127) return false;
+			for (const auto address : Game::Address::NearestRoomDistanceCalls) {
+				Memory::Patch(Game::Resolve(address), CallTo(Game::Resolve(address), reinterpret_cast<std::uintptr_t>(&WalkDistance)));
+			}
+			// 0x464400's best is the measure just taken: mov ebx, eax; mov [ebp-4], esi (the room); jmp to the next room.
+			Memory::Patch(keep, { 0x8B, 0xD8, 0x89, 0x75, 0xFC, 0xEB, static_cast<std::uint8_t>(rel) });
+			return true;
+		}
+		bool InstallPaydayFix() {
+			const auto distance = Game::Resolve(Game::Address::PaydayRoomDistance);
+			const auto keep = Game::Resolve(Game::Address::PaydayKeepBest);
+			const auto next = Game::Resolve(Game::Address::PaydayLoopNext);
+			// mov ecx, [edi+8]; add ecx, 0x1A; call 0x43C260 / mov ecx, [edi+8]; mov eax, [ebp-0x30]; add ecx, 0x1A.
+			if (!Memory::Matches(distance, { 0x8B, 0x4F, 0x08, 0x83, 0xC1, 0x1A, 0xE8, 0x0F, 0x9E, 0xFC, 0xFF })
+				|| !Memory::Matches(keep, { 0x8B, 0x4F, 0x08, 0x8B, 0x45, 0xD0, 0x83, 0xC1, 0x1A })) return false;
+			const auto rel = static_cast<std::int32_t>(next - (keep + 7));
+			if (rel < -128 || rel > 127) return false;
+			// mov ecx, edi (the state block); call PaydayDistance; 4 nops. The place is already pushed.
+			const auto call = static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(&PaydayDistance) - (distance + 2 + 5));
+			Memory::Patch(distance, { 0x8B, 0xCF, 0xE8, static_cast<std::uint8_t>(call), static_cast<std::uint8_t>(call >> 8), static_cast<std::uint8_t>(call >> 16),
+				static_cast<std::uint8_t>(call >> 24), 0x90, 0x90, 0x90, 0x90 });
+			// The new best is the walk just measured: mov ebx, eax; mov [ebp-8], esi (the room); jmp to the loop's next room.
+			Memory::Patch(keep, { 0x8B, 0xD8, 0x89, 0x75, 0xF8, 0xEB, static_cast<std::uint8_t>(rel) });
+			return true;
+		}
 	}
 
 	void CreatureFixes::OnLevelStart() {
@@ -353,6 +528,12 @@ namespace KeeperForge2 {
 		else Logger::Warning("Creature fixes: unexpected game code, a possessed sleeping creature still cannot be attacked.");
 		if (InstallUntagFix()) Logger::Debug("Creature fixes: workers stop digging or mining a tile as soon as it is untagged.");
 		else Logger::Warning("Creature fixes: unexpected game code, workers still finish their swing at an untagged tile.");
+		if (InstallPaydayFix()) Logger::Debug("Creature fixes: on payday creatures go to the Treasury or Dungeon Heart nearest to walk to.");
+		else Logger::Warning("Creature fixes: unexpected game code, on payday creatures still go to the nearest Treasury or Heart in a straight line.");
+		if (InstallNearestRoomFix()) Logger::Debug("Creature fixes: creatures choosing the nearest room (food, gold and the rooms' own choices) go by the walk, not the straight line.");
+		else Logger::Warning("Creature fixes: unexpected game code, other nearest-room choices still go by the straight line.");
+		if (InstallNoBedFix()) Logger::Debug("Creature fixes: creatures with no bed (the royals and others) no longer try to make one in a Lair.");
+		else Logger::Warning("Creature fixes: unexpected game code, creatures with no bed can still get stuck trying to make one.");
 		const auto target = Game::Resolve(Game::Address::ResetCreatureWalks);
 		// xor eax, eax / push esi / mov ax, [ecx + 6] / mov esi, [eax*4 + 0x6EE540]
 		if (!Memory::Matches(target, { 0x33, 0xC0, 0x56, 0x66, 0x8B, 0x41, 0x06, 0x8B, 0x34, 0x85, 0x40, 0xE5, 0x6E, 0x00 })) {

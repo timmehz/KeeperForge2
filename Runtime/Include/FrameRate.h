@@ -14,6 +14,9 @@ namespace KeeperForge2 {
 			static bool IsPresentHooked();
 			// Called every frame right before it is shown, when everything for it has been drawn.
 			static void SetBeforePresent(void (*callback)());
+			// Called every frame right after it was shown, on the game's thread, outside the world's tick (any number of
+			// callbacks, in the order added). Only while the present hook is in place.
+			static void AddAfterPresent(void (*callback)());
 			// Frames shown since the game started (wraps around); counted only while the present hook is in place.
 			static std::uint32_t FrameCount();
 			// The shortest and longest time from one frame shown to the next (microseconds) since the last call, and

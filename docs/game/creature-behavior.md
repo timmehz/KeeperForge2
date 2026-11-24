@@ -14,6 +14,25 @@
   arrival state 0x50 (unless it already has 0x50). [reference: Flame names
   80 "making a home"]
 
+## Creatures with no bed
+- [verified] A creature type's bed is the object in its creature data + 0x771
+  (Creatures.kwd record + 0xF52, an Objects.kwd id). These have none (0):
+  Imp, Prince Tristran, Skeleton, King Reginald, Prince Felix, Horny, Lord of
+  the Land, Prince Balder, Unique Skeleton and Jack. The heroes have the Hero
+  Creature Bed (6), the Fairy the Dark Elf Creature Bed (20).
+- [verified] The usual way into making a home, 0x46F390, checks for a bed
+  object. Two Lair state handlers do not. Both are thiscall (state block), with
+  the creature at block + 8, and return 0 when there is nothing to do.
+  - 0x46F4F0: a creature in a Lair with no bed of its own walks to a free spot
+    with arrival state 0x50.
+  - 0x46F6B0, that arrival: it makes the bed (0x4E03F0, then 0x48AD50 with the
+    object from + 0x771). If that fails, it finds another spot (0x4E0140) and
+    walks there with arrival 0x50 again.
+  - A creature with no bed can never make one, so it went round that for ever.
+    [user: the royals got stuck trying to make a bed]
+- CreatureFixes hooks both. For a creature whose type has no bed object they
+  return 0 at once, so it drops the job. [unverified: in game]
+
 ## Map changes reset walking creatures
 - [verified] 0x4E8D30 (fastcall, player) goes through the player's creatures
   (first at player + 6, next at creature + 0x10, tags into 0x6EE540). For
@@ -65,3 +84,35 @@
 - Fix (CreatureFixes): the search's two slot reads (0x469D34 dig, 0x46A1B6 gold) go to our function, which clears a
   slot whose holder is not a creature whose job is that task, face and slot, and reports it free. The read just
   before taking a slot (0x46A38D) then sees 0, so no other creature is sent to idle [unverified in game].
+
+## Payday: which Treasury or Heart
+- [verified] 0x472390 (thiscall (state block), creature at block + 8) picks where a creature goes for its wage. It
+  walks the owner's rooms (player + 0x36, next room + 8) for a Treasury (type 1) or a Dungeon Heart (type 5, room +
+  0x9A bit 1 clear) with gold in it (room + 0x49), each at its middle tile (room + 0x2B, + 0x2C). A room counts when
+  0x471630 says the creature can get there (flags 0x80: 0x4D0E60, the path search), and the nearest wins, measured
+  by 0x43C260: the straight-line distance squared (/ 4096). Walls do not count, so a Treasury just behind a wall
+  beat a Heart a short walk away. [user: creatures went to a Treasury rather than the closer Heart]
+- [verified] The path search 0x4D0E10 (cdecl (result, start x, start y, end x, end y, -2), in 1/256 tile) fills a
+  0x814-byte result: start and end, the number of waypoints at + 0x10 and the waypoints from + 0x14 as x, y pairs
+  (0x4D0320, 0x4CEF40). 0x4D0E60 sets the creature's walking rules as globals and then calls it; the last search is
+  kept and handed back for the same start and end.
+- CreatureFixes patches the choice in place: the call to 0x43C260 (0x472446) calls our own measure, the length of
+  the walk (the same path search, added up along its waypoints with an integer square root), and the game's second
+  straight-line sum (0x472455) is replaced by keeping that length as the best. Which rooms count is unchanged.
+  [unverified: in game]
+- [verified] The other 19 calls of 0x43C260, one by one:
+  - Choosing a room to walk to, right after the creature's own reachability check for that room passed (0x471630
+    or 0x471740, flags 0x80, both through 0x4D0E60, so the path search's walking rules are that creature's):
+    0x457010 (a Treasury or Heart holding more gold than the creature's + 0x3F4; 0x457107, 0x45711B), 0x464400 (a
+    Treasury or Heart with room for more gold, for workers bringing gold; 0x46450C, then the same sum again inline at
+    0x464515 like payday), and the rooms' own "nearest room of mine for this creature" methods 0x4D8870, 0x4DED00
+    (Hatchery), 0x4E0460, 0x4E2500, 0x4F1A20, 0x4F2B80, 0x4F3560, 0x4F6200 (0x4D896C, 0x4DED9A, 0x4E0528, 0x4E25F0,
+    0x4F1AEC, 0x4F2C42, 0x4F362C, 0x4F62E0). The calls in between (0x4E8210, 0x4D8430, 0x4F6140, 0x4E53B0) do not
+    search paths themselves.
+  - Left alone: 0x46C2D4 and 0x46C387 (0x46BD70, a Workshop: measured before any reachability check, so the search's
+    rules could be another creature's), 0x4689B2 (0x468910, the search comes after), 0x46DBEF and 0x46DBFA (two
+    things compared), 0x48C302 (an "already there" test), 0x43BB3E (a light) and 0x516BB2 (geometry).
+- CreatureFixes points those 11 calls at its own measure: the same path search from the call's two places (no
+  creature needed: the rules were just set), its length put on the game's scale (length² / 16 for 1/256 tile, the
+  squared distance / 4096 of 12.12), the straight line when no path is found. 0x464515 keeps that measure as the best,
+  as payday does. All or none: every call's bytes are checked before any is changed. [unverified: in game]

@@ -65,6 +65,7 @@ namespace KeeperForge2 {
 		PresentFrameFn originalPresentFrame = nullptr;
 		bool presentHooked = false;
 		void (*beforePresent)() = nullptr;
+		std::vector<void (*)()> afterPresent;
 		// For the console's fps command (PerformanceStats), read on another thread.
 		std::atomic<std::uint32_t> framesShown = 0;
 		// Frame times for it: present to present, so a frame limiter's wait is in them. Written on the game's thread,
@@ -94,6 +95,7 @@ namespace KeeperForge2 {
 			framesShown.fetch_add(1, std::memory_order_relaxed);
 			TimeFrame();
 			CountFrame();
+			for (const auto callback : afterPresent) { callback(); }
 		}
 
 		// patch.dll's Flip reads its "Vwait" setting with "mov eax, [setting]"; clearing the setting stops its extra
@@ -151,6 +153,7 @@ namespace KeeperForge2 {
 	}
 	bool FrameRate::IsPresentHooked() { return presentHooked; }
 	void FrameRate::SetBeforePresent(void (*callback)()) { beforePresent = callback; }
+	void FrameRate::AddAfterPresent(void (*callback)()) { if (callback != nullptr) afterPresent.push_back(callback); }
 	std::uint32_t FrameRate::FrameCount() { return framesShown.load(std::memory_order_relaxed); }
 	bool FrameRate::TakeFrameTimes(std::uint32_t& shortestUs, std::uint32_t& longestUs) {
 		shortestUs = shortestFrameUs.exchange(NoFrameTime, std::memory_order_relaxed);

@@ -1,10 +1,14 @@
 add_library(KeeperForge2 SHARED)
 target_sources(KeeperForge2 PRIVATE
+	Source/Autosave.cpp
 	Source/BackgroundRunning.cpp
 	Source/Bans.cpp
 	Source/CameraControls.cpp
 	Source/ConsoleCommands.cpp
 	Source/CpuThreads.cpp
+	Source/CustomCampaign.cpp
+	Source/ColorPicker.cpp
+	Source/KeeperColors.cpp
 	Source/PanelKeys.cpp
 	Source/DllMain.cpp
 	Source/EditorDialogs.cpp
@@ -36,17 +40,22 @@ target_sources(KeeperForge2 PRIVATE
 	Source/FrontEndTexts.cpp
 	Source/GameFixes.cpp
 	Source/GoodPlayer.cpp
+	Source/PossessionActions.cpp
 	Source/GuiTextCache.cpp
 	Source/LevelEditor.cpp
 	Source/LevelFiles.cpp
 	Source/MemoryWatch.cpp
 	Source/MenuVersionText.cpp
+	Source/ModelDetail.cpp
 	Source/Renderer.cpp
 	Source/Renderer/Backend.cpp
 	Source/Renderer/BackendD3D11.cpp
 	Source/Renderer/BackendD3D12.cpp
 	Source/Renderer/BackendVulkan.cpp
 	Source/Renderer/DirectDrawLayer.cpp
+	Source/Renderer/ModelSmoothing.cpp
+	Source/Renderer/RayScene.cpp
+	Source/RayTracing.cpp
 	Source/Screenshots.cpp
 	Source/SealedFile.cpp
 	Source/SessionOptions.cpp
@@ -58,6 +67,7 @@ target_sources(KeeperForge2 PRIVATE
 	Source/WidescreenFonts.cpp
 	Source/WidescreenGui.cpp
 	Source/WidescreenLoadingScreen.cpp
+	Source/WindowsMouse.cpp
 )
  target_link_libraries(KeeperForge2 PRIVATE
 	KFShared

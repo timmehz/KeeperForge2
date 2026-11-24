@@ -453,6 +453,32 @@ namespace KeeperForge2 {
 			SetShownRows(frontEnd, RowsToShow(types, rows));
 		}
 
+		// Choosing a map sets the lobby list's numbers from the level files (0x53F150, thiscall (front end; map name,
+		// flag) ret 8): with flag 0 every row is set to 0 (0x5488A0) and GlobalVariables.kwd is read, otherwise the map's
+		// own file; their creature pool entries set the rows of their types (0x53F600, 0x548E70). The Stone Knight is no
+		// keeper creature, so neither file gives it any and its row stayed at 0: none could ever come through the portal.
+		// Afterwards, a Stone Knight row left at 0 gets the heroes' starting number, while Stone Knights are on.
+		using LevelPoolLoadFn = std::int32_t(__fastcall*)(std::uint8_t* frontEnd, void* unused, const char* mapName, std::int32_t flag);
+		LevelPoolLoadFn originalLevelPoolLoad = nullptr;
+		std::int32_t __fastcall LevelPoolLoadDetour(std::uint8_t* frontEnd, void* unused, const char* mapName, std::int32_t flag) {
+			const auto result = originalLevelPoolLoad(frontEnd, unused, mapName, flag);
+			if (frontEnd == nullptr || SessionOptions::GetLocal(SessionOption::StoneKnightsOff)) return result;
+			auto* rows = *reinterpret_cast<std::uint8_t* const*>(frontEnd + Offset::LobbyCreatureList);
+			const auto* types = *reinterpret_cast<const std::uint8_t* const*>(frontEnd + Offset::LobbyCreatureTypes);
+			if (rows == nullptr || types == nullptr) return result;
+			const auto count = (std::max)(Load<std::uint32_t>(frontEnd + Offset::LobbyCreatureCount), allRows);
+			for (std::uint32_t row = 0; row < count; ++row) {
+				if (types[row] != Creature::Stone_Knight) continue;
+				auto& number = rows[row * CreatureListEntrySize + 1];
+				if (number == 0) {
+					number = HeroLobbyDefault;
+					Logger::Debug("Mercenary Portal: the level files give the Stone Knight none; its lobby row is set to "
+						+ std::to_string(HeroLobbyDefault) + ".");
+				}
+			}
+			return result;
+		}
+
 		// ---- The player's creature pool, as the portal reads it: count + 0xC, entries + 0x10 of { type, int number }.
 		std::uint8_t* PoolEntry(std::uint8_t* player, std::uint8_t type) {
 			auto* pool = player + Offset::PlayerCreaturePool;
@@ -647,6 +673,11 @@ namespace KeeperForge2 {
 			if (!rowsCanBeHidden) {
 				Logger::Warning("Mercenary Portal: unexpected lobby message code, the heroes stay in the lobby's creature list even when turned off.");
 			}
+		}
+		const auto levelPoolLoad = Resolve(Address::LevelPoolLoad);
+		if (!Memory::Matches(levelPoolLoad, { 0x6A, 0xFF, 0x68, 0x4B, 0xDE, 0x64, 0x00, 0x64, 0xA1, 0x00, 0x00, 0x00, 0x00 })
+			|| !Hook(levelPoolLoad, reinterpret_cast<void*>(&LevelPoolLoadDetour), reinterpret_cast<void**>(&originalLevelPoolLoad))) {
+			Logger::Warning("Mercenary Portal: unexpected map setup code, Stone Knights keep the level files' number (usually none).");
 		}
 		SessionOptions::OnLobbyWrite(&WriteRoomsToList);
 		SessionOptions::OnLobbyRead(&ReadRoomsFromList);

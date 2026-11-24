@@ -8,6 +8,7 @@ namespace KeeperForge2::Paths {
 	fs::path Screenshots() { return Root() / "SCRSHOTS"; }
 	fs::path Mods() { return Root() / "mods"; }
 	fs::path Maps() { return Root() / "maps"; }
+	fs::path Campaigns() { return Root() / "campaigns"; }
 	bool CreateFolders() {
 		std::error_code error;
 		bool ok = true;

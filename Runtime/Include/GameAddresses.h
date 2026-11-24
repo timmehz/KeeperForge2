@@ -143,6 +143,12 @@ namespace KeeperForge2::Game {
 		constexpr std::uintptr_t VersionFont = 0x007413C0;
 		// Startup title screen (0x5340F0): the same BltFast-based copy of the "TitleScreen\TitleScreen" image at 0,0
 		constexpr std::uintptr_t TitleScreenBlit = 0x005341A9;
+		// Its wait: "call 0x5B5E90 (time in ms); mov esi, eax; add esi, 10000", then a loop calling it again until the
+		// time is past (0x5341D8 to 0x5341F6, 0x1F bytes, no messages, no sleep); 0x5341F7 goes on.
+		constexpr std::uintptr_t TitleScreenWait = 0x005341D8;
+		constexpr std::uintptr_t TitleScreenWaitDone = 0x005341F7;
+		// The game's clock in milliseconds, cdecl (no arguments).
+		constexpr std::uintptr_t GameTimeMs = 0x005B5E90;
 		// Shows the finished frame (thiscall on the game object, no arguments); called once per frame
 		constexpr std::uintptr_t PresentFrame = 0x005587F0;
 		// GUI views (panels' text surfaces, made of 128x32 tiles): put text into a view, thiscall (view, x, y, text,
@@ -169,6 +175,16 @@ namespace KeeperForge2::Game {
 		constexpr std::uintptr_t PlayMovie = 0x0053BCD0;
 		// The video player's settings block, filled by PlayMovie (flags) and by the player from the film's header (size)
 		constexpr std::uintptr_t VideoPlayerConfig = 0x0073EDC8;
+		// Focus events while a video plays. The game's window messages go through 0x558C70, which on WM_ACTIVATE,
+		// WM_ACTIVATEAPP and WM_NCACTIVATE calls every handler in its list (0x757D71, 8 entries, contexts 0x20 after) as
+		// cdecl (event, 0, 0, context): event 0 when the low word of wParam is not 0 (focus coming), 1 when it is (focus
+		// lost). A screen mode change calls them with 2 (0x5582FA). PlayMovie adds VideoFocusHandler for as long as it
+		// plays: on 0 and on 1 alike it calls VideoTogglePause (cdecl (player), the player at VideoPlayer), which swaps
+		// the player's state (+ 0x9C, InterlockedExchange) between 3 playing and 4 paused and stops or plays its sound
+		// buffer (+ 0x5C) [verified in the assembly].
+		constexpr std::uintptr_t VideoFocusHandler = 0x0053C2E0;
+		constexpr std::uintptr_t VideoTogglePause = 0x005A8FF0;
+		constexpr std::uintptr_t VideoPlayer = 0x0073F594;
 		constexpr std::uintptr_t WriteBitmapFile = 0x005BA650;
 		// Screen setup: thiscall int (width, height, bit depth, windowed, two flags) on the game object, ret 0x18
 		constexpr std::uintptr_t SetScreenMode = 0x005581B0;
@@ -256,6 +272,25 @@ namespace KeeperForge2::Game {
 		// placer (0x4DE220 for a Hatchery), which takes the first tiles of the room's chain that fit; then objects one per middle
 		// tile, seeded by the tile's x and y. *(this + 6) is the object whose vtable + 0x1D8 gives a tile by x, y [verified].
 		constexpr std::uintptr_t RoomsPlaceObjects = 0x004EDFC0;
+		// An egg's hatching (object state 0x20, set in the object state table at 0x6E4DBC), fastcall (egg) returning int. It
+		// makes a chicken (object type 9) at the egg's position with the egg's owner (+ 0x28), wherever that is. The egg got
+		// there from its pen: at 4 seconds old its own state (0x18, 0x4A21C0) throws it off the pen at the pen's facing plus
+		// or minus 0x80 (speed 0x6000 across, 0x3000 up), and once it slows below 0x1000 it is put in state 0x20. Nothing
+		// keeps that throw inside the room [verified in the assembly].
+		constexpr std::uintptr_t EggHatch = 0x004A1CF0;
+		// The egg's own state (0x18), fastcall (egg) returning 0 when it removed the egg (not on a pen while young), run
+		// every turn while it sits and while it rolls after the throw [verified in the assembly].
+		constexpr std::uintptr_t EggTick = 0x004A21C0;
+		// An object's turn (object vtable + 0x14), thiscall (object): its state (0x49EED0, the object state table at
+		// 0x6E4B3C), then its move (0x4B2030). A chicken's wander state (0x4A24A0) turns it at random (0x4B2C10) and only
+		// looks at the room it is in when its walk ends, so chickens walked out of the Hatchery [verified in the assembly].
+		constexpr std::uintptr_t ObjectTurn = 0x0049BD20;
+		// A thing's move to a position (x, y, z, 12.12 fixed point), thiscall (thing, position) ret 4; it relinks the thing
+		// into the new tile's list when the tile changes (0x4B5020) [verified].
+		constexpr std::uintptr_t ThingSetPosition = 0x004B5560;
+		// A tile's floor height at a position on it, thiscall (tile, position) ret 4 (the egg laying, 0x4DE620, puts eggs
+		// 0x800 above it) [verified].
+		constexpr std::uintptr_t TileFloorHeight = 0x004545C0;
 		constexpr std::uintptr_t WorldRoomTypeOfTerrain = 0x0050B550;
 		// The bar text boxes are drawn with (0x411B30) has its sizes fixed in pixels: end pieces 16 wide, all pieces 32 high.
 		constexpr std::uintptr_t BarLeftEndWidth = 0x00411BD2;
@@ -308,6 +343,31 @@ namespace KeeperForge2::Game {
 		// Hands a device's wanted cooperative flags (device part +4) to DirectInput, thiscall (device part, int* result) ret 4.
 		// Its one caller, 0x5DCCD0, acquires the device straight after [verified].
 		constexpr std::uintptr_t InputDeviceApply = 0x005DCBE0;
+		// Mouse from Windows messages (WindowsMouse) [verified]. The input system's DirectInput mouse set-up, thiscall
+		// (input system, int* result) ret 4: makes the mouse at + 0x5C unless one is there (called from 0x5BB1C0, which
+		// hands the possibly empty pointer to 0x5DB6A0; that checks for none). Window (de)activation, thiscall (input
+		// system, int* result, active) ret 8: tells the keyboard's and the mouse's device parts (0x5DCCA0, thiscall
+		// (device part, active) ret 4, stores it at + 0x10) with no check for a missing mouse, then 0x5BC3A0, thiscall
+		// (input system, int* result) ret 4, which does check. The game sets up its mouse (0x557CB0 -> 0x5B2B60) before
+		// it makes its DirectDraw.
+		constexpr std::uintptr_t InputInitMouse = 0x005BC060;
+		constexpr std::uintptr_t InputWindowActivated = 0x005BC210;
+		constexpr std::uintptr_t InputDeviceSetActive = 0x005DCCA0;
+		constexpr std::uintptr_t InputApplyCooperation = 0x005BC3A0;
+		// The vtables of the DirectInput mouse's two input events (0x5DDA90 makes them): movement (0x14 bytes) and a
+		// button (0x24 bytes). Their one function hands the event to a listener (its + 0x14 or + 0x18). The control keys
+		// object's vtable: + 0x14 passes a movement on (0x5BB660), + 0x18 a button (0x5DD010, which puts its own Shift,
+		// Ctrl and Alt bits into the button's flags first).
+		constexpr std::uintptr_t MouseMoveEventVtable = 0x00672900;
+		constexpr std::uintptr_t MouseButtonEventVtable = 0x006728F8;
+		constexpr std::uintptr_t ControlKeysVtable = 0x00672888;
+		// What those vtables hold (checked before the mouse is replaced).
+		constexpr std::uintptr_t MouseMoveEventSend = 0x005DD8B0;
+		constexpr std::uintptr_t MouseButtonEventSend = 0x005DD8C0;
+		constexpr std::uintptr_t ControlKeysMouseMove = 0x005BB660;
+		constexpr std::uintptr_t ControlKeysMouseButton = 0x005DD010;
+		// The options menu's mouse sensitivity (an int; the Options slider 0x9C copies it to front end + 0x31176).
+		constexpr std::uintptr_t MouseSensitivity = 0x00759C21;
 		// Sets the pointer's image, cdecl (int* result, image, source rect, hot spot); a null image shows no pointer.
 		constexpr std::uintptr_t SetPointerImage = 0x005B2BD0;
 		// Draws the icons beside the hand (held things, what a click will do), thiscall (interface, x, y) ret 8.
@@ -405,6 +465,46 @@ namespace KeeperForge2::Game {
 		constexpr std::uintptr_t PlayerSlots = 0x0073F5C8;
 		constexpr std::uintptr_t PlayerSlotTexts = 0x0073F858;
 		constexpr std::uintptr_t PlayerListSelection = 0x00740340;
+		// The player color table: three shades a player number (0-7), 4 bytes each (red, green, blue, 255): bright, dark,
+		// middle. Filled by the game's start-up (0x4C04C0; keepers 3-7 red, blue, green, yellow, purple); read through
+		// 0x50F830 (player tag, shade) and directly (the lobby's rows, an engine thing's owner tint, 0x436361).
+		constexpr std::uintptr_t PlayerColors = 0x006E5058;
+		// Claimed floors and wall tops are per-player meshes, not tinted by the table above: at each game's player set-up
+		// (0x4C1E20) the game loads "Claimed Floor<d>_<n>" (0x4C2980, into player + 0x10AA + n*4) and "Claimed Top<d>_<n>"
+		// (0x4C2A70, into + 0x10BE), n 0-4, for each player object d (0-6, player number d + 1). Both thiscall (players;
+		// base name) ret 4; the name being loaded is sprintf'd into MeshNameBuffer before each load. A tile's mesh comes from
+		// its owner's arrays (0x43E860). Their colour is in their textures.
+		constexpr std::uintptr_t ClaimedFloorMeshesLoad = 0x004C2980;
+		constexpr std::uintptr_t ClaimedTopMeshesLoad = 0x004C2A70;
+		constexpr std::uintptr_t MeshNameBuffer = 0x00740C20;
+		// Engine materials: create-or-find by description, cdecl (description, add now) returning the material's number
+		// (the mesh loader's material callback 0x59A650 calls it). The materials (a pointer to an array of pointers) and
+		// their count. A material: + 4 its texture entries (0x10 bytes each, the first dword a texture handle), + 0x10
+		// flags (0x4000: all of + 0x15 textures * + 0x19 frames are filled, else only the first), + 0x15 / + 0x19 ints.
+		constexpr std::uintptr_t MaterialCreate = 0x0057C850;
+		constexpr std::uintptr_t Materials = 0x00765B00;
+		constexpr std::uintptr_t MaterialCount = 0x00765B04;
+		// The texture names: a pointer to entries of 0xC bytes { name, handle, ? } by a handle's number (handle + 0x24).
+		// A texture handle: + 0 its surface (null while not loaded), + 0x18 the next smaller version (mip level).
+		constexpr std::uintptr_t TextureNames = 0x00792D44;
+		// Loads a texture handle's surface when it has none, fastcall (handle): from the texture cache file (a compressed
+		// surface, 0x591070), else decoded and rescaled (0x5911E0). The cache placing (0x5941B0) calls it before painting.
+		// A handle's + 0x40 / + 0x41 bytes are its width and height in pixels.
+		constexpr std::uintptr_t TextureHandleLoad = 0x00590EC0;
+		// An engine surface's paint, thiscall (destination; source, x, y) ret 0xC: the source's pixels into the destination
+		// at x, y (pixels). Texture handles are painted into the cache pages with it when placed (0x5941B0 and others),
+		// and into the scaler's work surfaces (SurfaceScaler + 1 and + 5, pointers) while a texture is rescaled.
+		// Surfaces: + 0 vtable (+ 0x18 lock, thiscall () returning the pixels; + 0x1C unlock, thiscall (pixels) ret 4),
+		// + 4 width, + 8 height, + 0xC pitch (set by lock), + 0x10 pixel format (+ 8 bytes a pixel, + 0x1C/0x20/0x24/0x28
+		// red, green, blue, alpha masks).
+		constexpr std::uintptr_t EngineSurfacePaint = 0x00590450;
+		constexpr std::uintptr_t SurfaceScaler = 0x00792D48;
+		// The minimap's colors from GUI\map\MapColours.png, fastcall (minimap), when a level's interface is set up (called
+		// from 0x402F46): into the minimap's table (minimap + 0x138A, a pointer; entries 0xFFBBGGRR, red in the low byte), three a player for
+		// players 1-7 (from + 0x48, + 0x6C, + 0x90, 4 bytes a player), each also handed to the minimap's drawer
+		// (minimap + 0x53) by its vtable + 0x294, thiscall (player, kind 1 / 0 / 2, color pointer) ret 0xC. The draw reads
+		// the table by index (0x41ECE0; the local player's own flash through all the players' entries).
+		constexpr std::uintptr_t MinimapColorsLoad = 0x0041E810;
 		// Lobby counts of human and computer players (Add Computer Player checks their sum against the map's slots)
 		constexpr std::uintptr_t LobbyHumanCount = 0x0073FC18;
 		constexpr std::uintptr_t LobbyComputerCount = 0x0073FC10;
@@ -423,6 +523,9 @@ namespace KeeperForge2::Game {
 		constexpr std::uintptr_t LevelLostModeRead = 0x004BEACB;
 		constexpr std::uintptr_t LevelWonModeRead = 0x004BEBD6;
 		constexpr std::uintptr_t LevelEndingModeRead = 0x004BEDC0;
+		// The loaded level's flags byte read by the campaign win branch after 0x4BEDC0: bit 3 unlocks a secret level
+		// (0x5615F0), bit 4 another (0x561750), neither: Horny comes for the Portal Gem (0x4BF410). Both in PlayerSetStatus.
+		constexpr std::uintptr_t LevelEndingFlags = 0x006F2957;
 		constexpr std::uintptr_t GemEndingModeRead = 0x004BF41E;
 		constexpr std::uintptr_t OtherEndingModeRead = 0x004BF9EE;
 		// The victory cinematic creature's waits (states), thiscall (state), and each one's code past its camera check.
@@ -434,6 +537,12 @@ namespace KeeperForge2::Game {
 		// cdecl (status out, file, data, size, done out).
 		constexpr std::uintptr_t WorldSaveFile = 0x0050FD10;
 		constexpr std::uintptr_t FileWrite = 0x005B3EE0;
+		// A list of files in a folder (0x12 bytes: + 0 the found names, + 4 a flag, + 5 the pattern, + 9 the folder; the
+		// last two are kept as pointers). Emptying it, thiscall (list); filling it, thiscall (list, folder, pattern, flag)
+		// ret 0xC. The in-game save and load windows' list of saved games (its folder SavesFolder, "*.sav", 1).
+		constexpr std::uintptr_t FileListReset = 0x0054F0D0;
+		constexpr std::uintptr_t FileListCollect = 0x0054F0F0;
+		constexpr std::uintptr_t InGameSaveList = 0x006CE980;
 		constexpr std::uintptr_t FileRead = 0x005B3EB0;
 		// Two machines on one keeper. Sending an action, thiscall (session, action), ret 4. Handlers run on every machine,
 		// stdcall (action): the pick-ups (kinds 57 to 60) and casting a keeper spell.
@@ -470,6 +579,65 @@ namespace KeeperForge2::Game {
 		// "Is the keeper in a creature" where health flowers and a creature's mesh are drawn.
 		constexpr std::uintptr_t FlowerPossessedCompare = 0x0048E8E1;
 		constexpr std::uintptr_t MeshPossessedCompare = 0x00595416;
+		// Possession actions (PossessionActions, docs/game/possession.md). The possessed creature's attack and use action,
+		// thiscall (world, action), ret 4: data3 bit 0x8000000 is a melee hit at what is in front. Leaving a creature, an
+		// action handler that reads only the action's player tag, thiscall (world, action), ret 4.
+		constexpr std::uintptr_t PossessedAttackAction = 0x00514830;
+		constexpr std::uintptr_t StopPossessionAction = 0x00514590;
+		// Whether a creature's melee is ready, thiscall (creature, creature data), ret 4.
+		constexpr std::uintptr_t CreatureMeleeReady = 0x0048C9B0;
+		// The thing-in-front search (0x515420, also what the interface highlights, 0x40BE21 and 0x40FCEA) keeps a thing
+		// when this says so, thiscall (world, creature, thing, flag), ret 0xC: creatures, and only objects of types 1-3
+		// (gold, if the creature can carry more), 9, 14, 15, 16, 46, 64 (and 94 of another keeper), each also in reach
+		// (0x5162E0, thiscall (world, creature, thing), ret 8: within 0x80 of its facing and close enough by both sizes).
+		constexpr std::uintptr_t PossessedTargetFilter = 0x00516050;
+		// The search itself (world vtable + 0x334), thiscall (world, creature, position, angles), ret 0xC: the tag of the
+		// nearest thing kept. The game's angle of a direction, cdecl (dx, dy): 0 to 0x7FF, from a table (no floating point).
+		constexpr std::uintptr_t PossessedThingInFront = 0x00515420;
+		// The ranged abilities' search (world vtable + 0x338), thiscall (world, creature, position, angles, flag), ret 0x10: a tag.
+		constexpr std::uintptr_t PossessedRangedInFront = 0x00515520;
+		constexpr std::uintptr_t GameAngle = 0x0065FB54;
+		constexpr std::uintptr_t PossessedTargetReach = 0x005162E0;
+		// Experience: added up to the next level and no further, thiscall (creature, amount), ret 4.
+		constexpr std::uintptr_t CreatureAddExperienceCapped = 0x004858B0;
+		// A state block (creature + 0x24E): set its state, thiscall (block, state, value), ret 8; go to bed (when its
+		// sleep left is not 0), thiscall (block); follow a possessed creature, thiscall (block, leader tag), ret 4.
+		constexpr std::uintptr_t StateBlockSetState = 0x00476D30;
+		constexpr std::uintptr_t StateBlockGoToBed = 0x0046F440;
+		constexpr std::uintptr_t StateBlockFollow = 0x00461980;
+		// Walk somewhere, thiscall (state block, position (x, y, z), state on arrival, walking rules), ret 0xC: state 6 (walking)
+		// when a path is found, 0 when not.
+		constexpr std::uintptr_t StateBlockWalkTo = 0x00471890;
+		// The game's direction tables (32 bit, 16.16, by angle 0 to 0x7FF; they overlap, the second a quarter turn on): a
+		// heading's step across is the first's value, its step down the second's negative (as the possessed melee, 0x514830).
+		constexpr std::uintptr_t DirectionTableX = 0x006C1488;
+		constexpr std::uintptr_t DirectionTableY = 0x006C1C88;
+		// A creature's attack target (pit pairs use it): set, thiscall (creature, tag), ret 4; clear, thiscall (creature).
+		constexpr std::uintptr_t CreatureSetAttackTarget = 0x0048F390;
+		constexpr std::uintptr_t CreatureClearAttackTarget = 0x0048F3F0;
+		// A Prison room: open or close its door (by the room's door state), thiscall (room). An object's animation,
+		// thiscall (object, animation), ret 4.
+		constexpr std::uintptr_t PrisonToggleDoor = 0x004E35C0;
+		// Whether a room's tile takes in what the room holds, thiscall (tile): for a Prison, tile + 0xC is -1 (not its fence
+		// ring or door tile). The room's add-a-creature (0x4E5A70) needs it before taking a prisoner.
+		constexpr std::uintptr_t TileTakesPrisoners = 0x00454110;
+		constexpr std::uintptr_t ObjectSetAnimation = 0x0049EF60;
+		// Globals: a byte the game uses as game turns per second (the Prison door stays open twice that many room
+		// ticks), and the highest level the Training Room trains to (byte).
+		constexpr std::uintptr_t TurnsPerSecond = 0x006F2590;
+		constexpr std::uintptr_t MaxTrainingLevel = 0x006F28FC;
+		// Training costs this much gold a second (signed 16 bit, stored negative). A player's gold change, thiscall (player,
+		// amount, direct, tile x, tile y), ret 0x10: a negative amount with direct 0 is taken from its Treasuries and Heart
+		// (room types 1 and 5), returning what was taken. Gold shown over a place is ShowMoneyText: (owner tag, position,
+		// amount, 0). A player event, thiscall (world + 0x2E54, event, tag, value, value, value), ret 0x14.
+		constexpr std::uintptr_t TrainingCostPerSecond = 0x006F291D;
+		constexpr std::uintptr_t PlayerTakeGold = 0x004BA420;
+		constexpr std::uintptr_t PlayerEvent = 0x004C4600;
+		// In a shot's flight (0x4ABxxx): a shot cast by a possessed creature looks for a Training Target near it and, when
+		// it finds one, makes an effect there: this is that call, call dword ptr [edx + 0x38C] (6 bytes; the shot in ESI,
+		// the world in ECX, its vtable in EDX, five arguments pushed). Nothing else (no experience) [verified].
+		constexpr std::uintptr_t PossessedShotTrainingEffect = 0x004ABE54;
+		constexpr std::uintptr_t PossessedShotTrainingCheck = 0x004ABE28;
 		// Drawing a dig mark and taking one away, thiscall (bridge, action), ret 4.
 		constexpr std::uintptr_t BridgeShowDigMark = 0x00442570;
 		constexpr std::uintptr_t BridgeHideDigMark = 0x004425C0;
@@ -509,6 +677,10 @@ namespace KeeperForge2::Game {
 		constexpr std::uintptr_t CameraLoadPathBody = 0x0044A3B5;
 		constexpr std::uintptr_t CameraFinishPath = 0x0044D8F0;
 		constexpr std::uintptr_t CameraFinishTween = 0x0044BD70;
+		// The camera's zoom by an amount, thiscall (camera, amount) ret 4 (raw bytes in our export): unless the camera is
+		// held (+ 0xD92 bit 8, or a move under way at + 0xDD8), zoom (+ 0xD80) += amount, kept from the minimum
+		// (+ 0xD50) to the maximum (+ 0xD54) - 1. The zoom keys and the mouse wheel go through it.
+		constexpr std::uintptr_t CameraZoomBy = 0x00449CA0;
 		// The network object and its data send, thiscall (network, data, size, target), ret 0xC. Target 0xFFFF is everyone.
 		constexpr std::uintptr_t NetworkObject = 0x00758160;
 		constexpr std::uintptr_t NetworkSendData = 0x0055AC20;
@@ -558,6 +730,43 @@ namespace KeeperForge2::Game {
 		// After the map changes: every creature of the player that is walking (states 3, 4, 7, or 6 heading for state
 		// 1) gets a new path and state 1. fastcall (player). Called from three player functions that change the map.
 		constexpr std::uintptr_t ResetCreatureWalks = 0x004E8D30;
+		// Payday: where a creature goes for its wage (0x472390, thiscall (state block), creature at block + 8). It walks the
+		// owner's rooms (player + 0x36, next + 8) for a Treasury (type 1) or a Dungeon Heart (5, room + 0x9A bit 1 clear)
+		// holding gold (room + 0x49), each at its middle tile (room + 0x2B, + 0x2C), that 0x471630 says can be reached
+		// (flags 0x80), and keeps the one nearest in a straight line: at 0x472446 "mov ecx, [edi+8]; add ecx, 0x1A;
+		// call 0x43C260" (11 bytes; squared distance / 4096 from the creature to the place at [ebp-0x30], pushed just
+		// before), "cmp eax, ebx; jnc 0x4724A2", then at 0x472455 the same sum again into EBX (best) with the room into
+		// [ebp-8], up to 0x4724A2 [verified in the assembly]. Walls are not counted, so a Treasury behind a wall won over a
+		// Heart a short walk away.
+		constexpr std::uintptr_t PaydayRoomDistance = 0x00472446;
+		constexpr std::uintptr_t PaydayKeepBest = 0x00472455;
+		constexpr std::uintptr_t PaydayLoopNext = 0x004724A2;
+		// The path search, cdecl (result, start x, start y, end x, end y, -2), places in 1/256 tile (12.12 positions >> 4).
+		// The result (0x814 bytes): start x, y, end x, y, then at + 0x10 the number of waypoints (0 for no path) and from
+		// + 0x14 the waypoints as x, y pairs, the last the end (0x4D0320, 0x4CEF40). The creature's walking rules are
+		// globals set by 0x4D0E60 (thiscall (creature, place, flags)), which calls it the same way; the last search is kept
+		// and handed back for the same start and end [verified in the assembly].
+		constexpr std::uintptr_t PathFind = 0x004D0E10;
+		// The straight-line distance, thiscall (from, to) ret 4: squared / 4096 of two 12.12 positions.
+		constexpr std::uintptr_t StraightDistance = 0x0043C260;
+		// Choices of a room to walk to that measure each room with StraightDistance right after the creature's own
+		// reachability check for it passed (0x471630 or 0x471740 with flags 0x80, both through 0x4D0E60, so the path
+		// search's walking rules are this creature's), and keep that number as the best [verified in the assembly]:
+		// 0x457010 (a Treasury or Heart with more gold than the creature's + 0x3F4; calls at 0x457107 and 0x45711B),
+		// 0x464400 (a Treasury or Heart with room for gold; 0x46450C, then the same sum again inline at 0x464515 into
+		// EBX and the room into [ebp-4], up to 0x464562), and rooms' own "nearest room of mine for this creature"
+		// (0x4D8870, 0x4DED00 the Hatchery, 0x4E0460, 0x4E2500, 0x4F1A20, 0x4F2B80, 0x4F3560, 0x4F6200). Not here: the
+		// other StraightDistance calls, which are ranges, "already there" tests or come before any reachability check.
+		constexpr std::uintptr_t NearestRoomDistanceCalls[] = { 0x00457107, 0x0045711B, 0x0046450C, 0x004D896C, 0x004DED9A, 0x004E0528,
+			0x004E25F0, 0x004F1AEC, 0x004F2C42, 0x004F362C, 0x004F62E0 };
+		constexpr std::uintptr_t GoldDropKeepBest = 0x00464515;
+		constexpr std::uintptr_t GoldDropLoopNext = 0x00464562;
+		// Lair state handlers, thiscall (state block) returning 0 when there is nothing to do: in a Lair with no bed of its
+		// own, walk to a free spot with arrival 0x50 ("make a home"); and that arrival, which makes the bed (0x4E03F0 ->
+		// 0x48AD50, the object from creature data + 0x771) and on failure walks to another spot with arrival 0x50. Neither
+		// checks that the type has a bed (0x46F390, the usual way in, does).
+		constexpr std::uintptr_t LairStateInRoom = 0x0046F4F0;
+		constexpr std::uintptr_t MakeHomeArrival = 0x0046F6B0;
 		// Workshop: whether the item being made is done, thiscall (list, work done) ret 4, and its percent done (same).
 		// Both read the build time of item 0 of the list (a ring of 0x80 items of 0x10 bytes, build time a word at
 		// + 0); the item being made is at index list + 0x801 (0x506930 reads it, 0x506970 moves on), count at + 0x803.
@@ -566,6 +775,17 @@ namespace KeeperForge2::Game {
 		// Computer player, moving creatures to a threat (0x4FE0B0): "jz" past the drop when the threat's tile is the
 		// computer's own, so it only tried to drop onto tiles it cannot drop on.
 		constexpr std::uintptr_t ThreatDropOwnTileJump = 0x004FE5AA;
+		// The same function's pick of a creature to drop at the threat (ESI the computer player, its keeper at + 0xE with
+		// the creature count at + 0x16; EBX the creature): every test that rules a creature out goes to 0x4FE50D (next);
+		// the last, "test byte [eax+0x686], 1; jz 0x4FE522" (9 bytes at 0x4FE504, not a worker), picks it. Then 0x48E6A0
+		// (creature, keeper tag) says whether it is the keeper's: "test eax, eax; jz 0x4FE914" (8 bytes at 0x4FE544)
+		// skips the drop when it is not, and the next pass picks the same creature again.
+		constexpr std::uintptr_t ThreatPickLastTest = 0x004FE504;
+		constexpr std::uintptr_t ThreatPickNext = 0x004FE50D;
+		constexpr std::uintptr_t ThreatPicked = 0x004FE522;
+		constexpr std::uintptr_t ThreatPickOwnedTest = 0x004FE544;
+		constexpr std::uintptr_t ThreatPickOwned = 0x004FE54C;
+		constexpr std::uintptr_t ThreatPickNotOwned = 0x004FE914;
 		// Computer player: 16 bit stores of a 32 bit threat total into its response slot (cp + slot * 8 + 0x5A), each
 		// "mov word [...], reg" of 5 bytes, followed by its resume address. 0x4F9B90 and 0x4FA000 (two events): enemy
 		// threat * cp + 0x4DA / 100 - own threat (DX), and minus own threat (AX after neg); 0x4FE9xx (an attack task):
@@ -612,6 +832,176 @@ namespace KeeperForge2::Game {
 		constexpr std::uintptr_t HeartWarningCompare = 0x004D9ACB;
 		constexpr std::uintptr_t HeartWarningFifty = 0x004D9AD0;
 		constexpr std::uintptr_t HeartWarningTen = 0x004D9AE2;
+		// Hero party spawn (trigger action 0xE), thiscall (world, party index, action point, invasion flag) ret 0xC, 1 done.
+		// Each of up to 16 members is made by 0x519B20 (thiscall, ret 0x10, 0 when no creature could be made); its result is
+		// tested at 0x51A274 ("test eax, eax; jz 0x51A756", 8 bytes, 0x51A756 returns 0 with the party half made). After the
+		// last member the finish code at 0x51A5E2 (same stack as the loop) counts the party, finds the leader (creature
+		// + 0x46F bit 2; pointer kept at [esp + 0x88], tag in DI, both 0 for none), at 0x51A66A ("mov eax, [esp+0x18];
+		// test eax, eax; jz 0x51A6CF", 8 bytes) plays effect 0x2B at the leader, links the followers, and at 0x51A73A
+		// ("mov eax, [esp+0x88]; mov [eax+0x3E1], bl", 13 bytes) gives the leader its place in the party; 0x51A747 returns 1.
+		// Loads a PNG picture by name, cdecl (name), through the bridge object (0x795700) method + 0x11C; returns a picture
+		// record of 40 bytes ({ red, green, blue, alpha masks, bits per pixel, bytes-per-pixel flag, pixels, width, height,
+		// row pitch }) or 0 when the file is missing. Its one caller (0x5912D3) reads width and height (+ 0x1C, + 0x20) and
+		// copies the pixels (0x5914E0) without a check; the record is not freed there.
+		constexpr std::uintptr_t LoadPngPicture = 0x0059A4B0;
+		// Converts a creature type record as read from a creature list (0x1549 bytes) into the game's own, thiscall
+		// (type, record) ret 4; its one caller is the list reader (0x56A41A). Animation n of a record is a 0x54-byte
+		// resource at + 0x20 + 0x54 * n, its file name first (10 Stunned, 11 In Hand).
+		constexpr std::uintptr_t CreatureRecordConvert = 0x00568E30;
+		// Builds the meshes of a room tile drawn by the bridge object (called at 0x43E3E0 for room terrain, terrain flag
+		// 0x10), thiscall (bridge, x, y, tile, terrain data, mesh arrays) ret 0x14. It takes the tile's room as 0x4559B0
+		// does (ThingTable[(tile + 2, 16 bit) & 0xFFF]) and reads the room's data (+ 0x19) with no check.
+		constexpr std::uintptr_t RoomTileMeshes = 0x00443610;
+		// The sound list thread's stop (0x60D630, thiscall (thread object), from its destructor 0x60D5C0): sets + 0x39
+		// (exit) and + 0x3C (wake, InterlockedExchange), then at 0x60D64A waits for + 0x38 (stopped) in a loop that never
+		// gives up the processor ("mov al, [esi+0x38]; test al, al; jnz +7; mov al, [esi+0x38]; test al, al; jz -7",
+		// 14 bytes, ESI the object); 0x60D658 goes on.
+		// The player interface's push of an action, thiscall (interface, action) ret 4: counts it (+ 0xA) and sends it
+		// through its session (+ 4) with SessionPushAction.
+		constexpr std::uintptr_t InterfacePushAction = 0x004346E0;
+		// A text input button's configure, thiscall (button, config) ret 4: the input's character limit (button + 0x280)
+		// is the config's + 0x1A, or 11/16 by keyboard layout when that is -1. The limit counts the closing 0, so it holds
+		// one character fewer. The TCP/IP menu's port box is button id 0x212 with a limit of 5 (4 digits).
+		constexpr std::uintptr_t TextInputConfigure = 0x0052AA10;
+		// The front end component (the menus), and its menu action handler, cdecl (argument, action, front end): 0x58 with
+		// argument 0x22 opens the map list (window 34) from the skirmish screen, 0x5A starts the skirmish (play mode 2,
+		// local player 3, level name from front end + 0x6580, then the game component), 0x18 leaves the skirmish screen,
+		// 0x4E is the map list's tick (keep the clicked map) and 0x4F its cross (back to the map chosen before, + 0x6033).
+		constexpr std::uintptr_t FrontEndComponent = 0x0070D6D8;
+		constexpr std::uintptr_t FrontEndMenuAction = 0x005306F0;
+		// Hides (0) or shows (1) a front end window, cdecl (show, window, front end) (Flame calls it changeGui). Window 7 is
+		// the briefing: its tick sends action 0x0C (start the game component with what is set up), its cross 0x0A.
+		constexpr std::uintptr_t FrontEndChangeWindow = 0x005391F0;
+		// The menu step that shows the skirmish screen once the camera has flown there, cdecl (front end): shows window 9
+		// and runs action 0x15 (the skirmish screen's set up, its map list). Reached from the Single Player menu's Skirmish
+		// button (click 0x538000) and on the way back from a skirmish. (A menu button's click, 0x528610, calls the button's
+		// action with config + 0x16 and + 0x1A, then hides the button's window when config + 0x12 is set, then shows the
+		// window config + 0xE names: an action on its own switches no windows.) The same function as SkirmishSetup, which
+		// SkirmishSwapKeeper hooks; it calls CustomCampaign from there.
+		constexpr std::uintptr_t SkirmishScreenStep = 0x00538AC0;
+		// Menu window titles are pictures made once when the front end starts (0x536850, from the text ids at 0x6B8468):
+		// TitleBake is thiscall (front end; settings), the settings packed: text, picture, second picture, area {0, 0, 640,
+		// 70}, size out (4 ints), colour (5 bytes), 0, byte 3, font 9 (8 when the first try is 630 or more wide), 2.
+		// A picture is a 0x28-byte record: ImageCreate thiscall (record; {width, height}, pixel format, 0, 0) sets it up,
+		// ImageAllocate thiscall (record; result out, 0 when done) gives it pixels (+ 0x18, + 0x20 * + 0x24 bytes).
+		// Draws a picture record into a frame at x, y (frame pixels, no scaling): thiscall (front end + 0x30D3F; out,
+		// frame (front end + 0x2DD65), x, y, picture, source area or null, 0), ret 0x1C. The picture's format must be the
+		// game's (ImagePixelFormat), as ImageCreate makes it. ImageFree, fastcall (record), frees a record's pixels.
+		constexpr std::uintptr_t PictureDraw = 0x0052CF90;
+		// The 3D engine's camera as it last drew the world (set by 0x575A00 from the camera it is given): position (3
+		// floats, tiles), rotation (9 floats, row major, view to world: 0x594E70 multiplies a view direction by it in the
+		// screen-to-world code 0x572920), focal length (pixels), the viewport (left, right, top, bottom) and its middle.
+		// The projection (0x575F10): screen = middle + focal * view.xy / view.z. Read by the ray tracer.
+		constexpr std::uintptr_t EngineCameraPosition = 0x00760AB8;
+		constexpr std::uintptr_t EngineCameraRotation = 0x00760AC4;
+		constexpr std::uintptr_t EngineCameraFocal = 0x00760AE8;
+		constexpr std::uintptr_t EngineCameraCenterX = 0x00760AFC;
+		constexpr std::uintptr_t EngineCameraCenterY = 0x00760B00;
+		// The bridge's vtable (Flame: CBridge), to check a bridge pointer before reading its lights.
+		constexpr std::uintptr_t BridgeVtable = 0x0066CC94;
+		// Builds the results screen's table after a game, fastcall (front end): front end + 0x3033C, one row per player
+		// (0x370 bytes each), the count by the game type copy 0x75AD4F (2 skirmish: the chosen skirmish map record's
+		// players, + 0x80 of record + 0x6608 in + 0x657C; 1 and 4 one row). The skirmish results window (its list at
+		// 0x6B1868, widget 195 drawn by 0x53D550) reads the table without a check.
+		constexpr std::uintptr_t SkirmishResultsTable = 0x0053C520;
+		constexpr std::uintptr_t ImageFree = 0x005B5310;
+		// The briefing window (7): its config (first byte the window id, its button list at + 0x3E) and the game's list.
+		// The list's boxes take the right of the window from x 764 (2560-wide layout); the left is empty.
+		constexpr std::uintptr_t BriefingWindowConfig = 0x006AEF38;
+		constexpr std::uintptr_t BriefingButtons = 0x006AEF80;
+		constexpr std::uintptr_t TitleBake = 0x00536370;
+		// The skirmish map list's background picture (a picture record; its columns, the size column's tinted green),
+		// drawn by the list frame widget 231 (0x541940) through the picture draw 0x52CF90, which takes the width from
+		// + 0x1C and the height from + 0x20 and steps rows by the pitch (+ 0x24), so a smaller width crops its right side.
+		constexpr std::uintptr_t MapListBackground = 0x007401F0;
+		// The map list's row highlight picture (the chosen and pointed rows, drawn at the background's left edge by the
+		// list's draw 0x5410C0); it also has a green part over the size column.
+		constexpr std::uintptr_t MapListRowHighlight = 0x00740218;
+		// The chosen map's details (widget 468): the name in a banner, then "Max Players : <second field>" (text 0x5D4,
+		// format "%s : %s"), then the third field, each skipped when the chosen row has no such field before the list's
+		// 0xFFFF. cdecl (widget, front end); reads the list at SkirmishMapList and the row at MapListChosenRow.
+		constexpr std::uintptr_t MapListDetails = 0x00540600;
+		constexpr std::uintptr_t ImageCreate = 0x005B5270;
+		constexpr std::uintptr_t ImageAllocate = 0x005B52C0;
+		constexpr std::uintptr_t ImagePixelFormat = 0x0079D830;
+		// A text from the level's briefing table, cdecl (id), game text (an empty one when the table is not loaded). The table
+		// is loaded by 0x553800 (level text number; names at 0x6BC100). Ids 0 and 1 are drawn as the level's name, 2 in the
+		// briefing's first box and first in the in-game objectives (after main text 0x580), 3 in the briefing's tall box and,
+		// with 4 and 5, after main text 0x581 in the objectives (0x4207E0) [unverified: what the stock texts say].
+		constexpr std::uintptr_t BriefingText = 0x00553AC0;
+		// The skirmish map list (raw bytes in our export): a wide text of 4 fields per map (name, players, size, the map's
+		// file field), each ended by 0, the list by 0xFFFF; made from GameAlloc by 0x53FEB0 when the front end starts.
+		// Its row count (-1 = count again; 0x540B20 counts the 0s / 4), the clicked row (0x5416E0, cdecl (row, ?, front
+		// end), stores it here, then loads that map's preview by its name field).
+		constexpr std::uintptr_t SkirmishMapList = 0x00740354;
+		constexpr std::uintptr_t SkirmishMapListCount = 0x006B442C;
+		constexpr std::uintptr_t MapListChosenRow = 0x00740348;
+		constexpr std::uintptr_t MapListClick = 0x005416E0;
+		// The game's start-up (0x5A5DA0, cdecl (argc, argv), called once at 0x64780B). It first makes "DKII MUTEX"
+		// (0x5BAE70) and quietly stops when the mutex was already there (another copy running). Then each of these calls
+		// (a "call rel32", result 0 = failed) ends it without a word: the command line (0x5A63B0, cdecl (argc, argv)),
+		// fonts and texts (0x552F10, no arguments), the window (0x557CB0, thiscall on 0x756EE8), speech (0x567F90,
+		// thiscall on 0x75B8E8, only with sound), the network library (0x559BE0, thiscall on 0x758160), the Windows check
+		// (0x557FB0, thiscall on 0x756EE8) and the components (0x552BE0, no arguments).
+		constexpr std::uintptr_t GameStartupCall = 0x0064780B;
+		constexpr std::uintptr_t GameStartup = 0x005A5DA0;
+		constexpr std::uintptr_t StartupCommandLineCall = 0x005A5FAC;
+		constexpr std::uintptr_t StartupCommandLine = 0x005A63B0;
+		constexpr std::uintptr_t StartupFontsCall = 0x005A5FBC;
+		constexpr std::uintptr_t StartupFonts = 0x00552F10;
+		constexpr std::uintptr_t StartupWindowCall = 0x005A60DB;
+		constexpr std::uintptr_t StartupWindow = 0x00557CB0;
+		constexpr std::uintptr_t StartupSpeechCall = 0x005A6187;
+		constexpr std::uintptr_t StartupSpeech = 0x00567F90;
+		constexpr std::uintptr_t StartupNetworkCall = 0x005A6199;
+		constexpr std::uintptr_t StartupNetwork = 0x00559BE0;
+		constexpr std::uintptr_t StartupWindowsCheckCall = 0x005A61D0;
+		constexpr std::uintptr_t StartupWindowsCheck = 0x00557FB0;
+		// Inside it: "push 0; push 0; push 6; call 0x557FD0" (Windows at least 6.0 by GetVersionExA, stdcall (major,
+		// minor, service pack)), then "neg eax; sbb eax, eax; inc eax": the game only passed on Windows before Vista,
+		// unless Windows reported an older version to it. The "push 6" is at 0x557FB4.
+		constexpr std::uintptr_t WindowsCheckMajorPush = 0x00557FB4;
+		constexpr std::uintptr_t StartupComponentsCall = 0x005A61F8;
+		constexpr std::uintptr_t StartupComponents = 0x00552BE0;
+		// The multiplayer session list (front end 0x54D370, thiscall (front end), raw bytes in our export; disassembled
+		// with ml + dumpbin). Sessions: count 0x73FE74, array 0x73FE78 of 0xA4-byte entries (+ 0 version, major << 16 |
+		// minor; + 0x28 players in it; + 0x40 map info, 12 bytes: + 0x40 bits 0..6 computer players, + 0x42 (16 bit) the
+		// map's players, + 0x41 name length, + 0x44 name hash, + 0x48 file check; + 0x64 name, wide). Each entry's text is
+		// name, "#players / max#", map name, "#major.minor" (built in [esp + 0x30], 64 characters, at 0x54D548 every
+		// path has it) and the separator. Joinable (front end + 0x602B + index, a byte; written by 0x54D58C) when players
+		// < max, the version equals ours (0x6BC430 major, 0x6BC434 minor), the file check equals ours (0x7962A0) and max
+		// > 1. At 0x54D548 "mov eax, [0x6BC430]" (5 bytes), at 0x54D58C "test ebp, ebp; jnz +5; mov ebp, 4" (9 bytes).
+		constexpr std::uintptr_t SessionListVersionDone = 0x0054D548;
+		constexpr std::uintptr_t SessionListVersionResume = 0x0054D54D;
+		constexpr std::uintptr_t SessionListJoinableDone = 0x0054D58C;
+		constexpr std::uintptr_t SessionListJoinableResume = 0x0054D595;
+		constexpr std::uintptr_t SessionCount = 0x0073FE74;
+		constexpr std::uintptr_t SessionArray = 0x0073FE78;
+		// (The game's version is GameVersionMajor / GameVersionMinor, above.)
+		constexpr std::uintptr_t GameFileCheck = 0x007962A0;
+		// Finds a session's map among ours, thiscall (front end, map info, wide name out) ret 8: 1 found (its name), 0 not
+		// (text 0xC06). Matches by the map info's name length (+ 1) and name hash (+ 4).
+		constexpr std::uintptr_t SessionMapLookup = 0x0053ED60;
+		constexpr std::uintptr_t SoundThreadStopWait = 0x0060D64A;
+		constexpr std::uintptr_t SoundThreadStopResume = 0x0060D658;
+		// Loading a saved game (in the game component's loop 0x525370): from 0x52555E to 0x5255AF (0x51 bytes) the save's
+		// name (wide, game config 0x75AD47 + 0x90, as 0x55D550 returns it) is copied into a 64-character buffer, turned
+		// into the code page's text in a 64-byte one (0x5557E0, WideCharToMultiByte), then "%s%s" of the saves folder
+		// (0x758754, a full path) and that name is written into a 64-byte buffer at [esp + 0x114] with no limit. At
+		// 0x5255CD "lea eax, [esp+0x114]" (7 bytes) passes it to the save loader (0x50E920); nothing else reads them.
+		constexpr std::uintptr_t SaveLoadPathBuild = 0x0052555E;
+		constexpr std::uintptr_t SaveLoadPathResume = 0x005255AF;
+		constexpr std::uintptr_t SaveLoadPathUse = 0x005255CD;
+		constexpr std::uintptr_t GameConfigSaveName = 0x0075ADD7;
+		constexpr std::uintptr_t SavesFolder = 0x00758754;
+		constexpr std::uintptr_t HeroPartySpawnFailTest = 0x0051A274;
+		constexpr std::uintptr_t HeroPartySpawnNext = 0x0051A27C;
+		constexpr std::uintptr_t HeroPartyFinish = 0x0051A5E2;
+		constexpr std::uintptr_t HeroPartyLeaderEffect = 0x0051A66A;
+		constexpr std::uintptr_t HeroPartyLeaderEffectResume = 0x0051A672;
+		constexpr std::uintptr_t HeroPartyLeaderEffectSkip = 0x0051A6CF;
+		constexpr std::uintptr_t HeroPartyLeaderPlace = 0x0051A73A;
+		constexpr std::uintptr_t HeroPartyDone = 0x0051A747;
 		// Bump mapping: the game's setting (video settings 0x759A78 + 0x98; 0 off, 1 du/dv, 2 with luminance; written by
 		// 0x566860, which also saves it as "BumpMappingConfig"). Read by "mov eax, [0x759B10]" (5 bytes) where the engine
 		// loads its textures (0x59856B: when not 0, also BumpWater, BumpWaterBumpMap, BumpWaterEnvMap and the same for
@@ -619,6 +1009,26 @@ namespace KeeperForge2::Game {
 		constexpr std::uintptr_t BumpSetting = 0x00759B10;
 		constexpr std::uintptr_t BumpSettingTexturesRead = 0x0059856B;
 		constexpr std::uintptr_t BumpSettingEngineRead = 0x0059D951;
+		// Model detail. The models are progressive meshes. The game's "PMesh Reduction Level" setting (video settings + 0xA4,
+		// 0 when not saved) is read once where the engine starts, "mov eax, [0x759B1C]" (5 bytes) at 0x59864C, and handed to
+		// 0x5747C0, which keeps it at 0x760AB0; in play mode 5 the engine is given 16 instead (0x598648, "push 0x10").
+		// The two mesh draw set-ups (0x580FC5 and 0x584A05) work out each mesh's detail from its depth and size,
+		// v = (460 / focal * depth - t) / (10 - t) - level / 16 with t = 1 + 6 * min(radius, 0.5), kept to 0..1 and times
+		// 12 (mesh + 0x70 / + 0x7C). 0 is the whole mesh: a mesh with flag 0x4000 skips the sum and gets 0. A level of 16
+		// or more makes every v 0, every mesh whole at any distance [verified in the assembly].
+		constexpr std::uintptr_t MeshReductionSetting = 0x00759B1C;
+		constexpr std::uintptr_t MeshReductionEngineRead = 0x0059864C;
+		constexpr std::uintptr_t EngineMeshReduction = 0x00760AB0;
+		// The engine's draw of the world (0x58F640): its queue is grouped into batches of the same textures and states; for
+		// each, 0x589D90 starts it (cdecl (batch)), each queued primitive adds its triangles through its vtable + 4
+		// (thiscall (primitive, index, entry) ret 8), and 0x58A150 draws it (cdecl ()); the draw calls happen there, or
+		// inside an add when the buffer is full (0x58A000) [verified in the assembly]. The models' adds: creatures'
+		// meshes (CEngineAnimMesh, vtable 0x66FD64) 0x5848B0 and objects' (CEngineDynamicMesh, vtable 0x66FD1C) 0x582CE0
+		// [vtables verified; class names reference: Flame's mapping]. Terrain is drawn by other primitives.
+		constexpr std::uintptr_t EngineBatchBegin = 0x00589D90;
+		constexpr std::uintptr_t EngineBatchDraw = 0x0058A150;
+		constexpr std::uintptr_t AnimMeshAddTriangles = 0x005848B0;
+		constexpr std::uintptr_t DynamicMeshAddTriangles = 0x00582CE0;
 		// The engine's flags (0x10 bump du/dv in use, 0x20 with luminance). Liquid surfaces: thiscall 0x5873A0 makes one
 		// (arguments ..., 4 texture, 5 bump map, 6 environment map, 7 flags (0x8000 bump), 8 opacity, ...). Water tiles
 		// (engine method 0x5A2570) use the engine's BumpWater textures (engine + 0x72, + 0x76, + 0x7A) when bump is in use
@@ -764,6 +1174,10 @@ namespace KeeperForge2::Game {
 		// Makes the game settings' creature list and the front end's copy (count entries of 5 bytes, all zero), thiscall
 		// (game settings, front end list out, count) ret 8
 		constexpr std::uintptr_t MakeCreatureList = 0x0055DA50;
+		// Sets the lobby's lists from the level files when a map is chosen, thiscall (front end; map name, flag) ret 8:
+		// flag 0 sets every creature row to 0 (0x5488A0) and reads GlobalVariables.kwd, otherwise the map's own file. Their
+		// creature pool entries set the rows of their types (callback 0x53F600, setter 0x548E70: row count at + 1).
+		constexpr std::uintptr_t LevelPoolLoad = 0x0053F150;
 		// How many rows the game settings' creature list has (game settings + 0x188); level setup reads this many.
 		constexpr std::uintptr_t GameCreatureListCount = 0x0075AECF;
 		// This machine's memory in MB for the lobby's Ram column, cdecl (): GlobalMemoryStatus's total + 1. Only shown.
@@ -1019,6 +1433,9 @@ namespace KeeperForge2::Game {
 		// full turn: turn, tilt, and a lean that eases back to 0), and two more view values (32 bits each).
 		constexpr std::uintptr_t CameraPosition = 0xD68;
 		constexpr std::uintptr_t CameraZoom = 0xD80;
+		// The zoom's limits, as CameraZoomBy keeps it.
+		constexpr std::uintptr_t CameraZoomMin = 0xD50;
+		constexpr std::uintptr_t CameraZoomMax = 0xD54;
 		constexpr std::uintptr_t CameraTurn = 0xD84;
 		constexpr std::uintptr_t CameraTilt = 0xD86;
 		constexpr std::uintptr_t CameraLean = 0xD88;
@@ -1086,6 +1503,12 @@ constexpr std::uintptr_t WorldGameSeed = 0x15A0;
 		// Any thing's position (12.12 fixed point: tile = value >> 12)
 		constexpr std::uintptr_t ThingPositionX = 0x1A;
 		constexpr std::uintptr_t ThingPositionY = 0x1E;
+		constexpr std::uintptr_t ThingPositionZ = 0x22;
+		// A thing's speed, x and y (z at + 0x10C), 32 bit; 0x4B1F20 adds to all three [verified].
+		// A thing's heading (16 bit, 0x800 a full turn); its turn keeps the last one at + 0x102 [verified: 0x49BD4A].
+		constexpr std::uintptr_t ThingHeading = 0xF4;
+		constexpr std::uintptr_t ThingVelocityX = 0x104;
+		constexpr std::uintptr_t ThingVelocityY = 0x108;
 		// Player's dungeon heart tile (1,1 when it has none)
 		constexpr std::uintptr_t PlayerHeartX = 0xB43;
 		constexpr std::uintptr_t PlayerHeartY = 0xB45;
@@ -1099,6 +1522,49 @@ constexpr std::uintptr_t WorldGameSeed = 0x15A0;
 		// Player interface: its player's tag, and the creature type shown in the Workers row
 		constexpr std::uintptr_t InterfacePlayerTag = 0x8;
 		constexpr std::uintptr_t InterfaceWorkerType = 0x123;
+		// Player interface: its game session (0 when no game is running), which its push (InterfacePushAction) sends through.
+		constexpr std::uintptr_t InterfaceSession = 0x4;
+		// Front end: its list of menu windows (a pointer to the first; the game's own "window shown" lookup 0x5322D0 takes
+		// the first with its shown flag set), and in each window its id (9 the skirmish screen, 34 the map list), shown flag
+		// and next window. + 0x6016 is only the window the map list was opened from (9 or 32), not the one shown.
+		constexpr std::uintptr_t FrontEndWindowList = 0x30FCE;
+		constexpr std::uintptr_t MenuWindowId = 0x44;
+		constexpr std::uintptr_t MenuWindowShown = 0x48;
+		constexpr std::uintptr_t MenuWindowNext = 0x62;
+		// A menu window's first widget, and in each widget the next one, its id, and its text id (button config + 0x40;
+		// read each frame by text widgets (0x5323B0, nothing drawn while 0), and the title picture's number for titles).
+		constexpr std::uintptr_t MenuWindowWidgets = 0x6A;
+		constexpr std::uintptr_t MenuWidgetNext = 0x7C;
+		constexpr std::uintptr_t MenuWidgetId = 0x74;
+		constexpr std::uintptr_t MenuWidgetText = 0x30;
+		// A list widget's row height in frame pixels (its draw, 0x5445F0, starts the rows at the top of its box and steps
+		// by this for each row shown).
+		constexpr std::uintptr_t MenuListRowHeight = 0x8C;
+		// A widget's "hide my window after the click" flag (button config + 0x12), read by the click (0x528610) after the
+		// button's action.
+		constexpr std::uintptr_t MenuWidgetHidesWindow = 0x5D;
+		// Front end: the skirmish map records (a pointer, 0x890 bytes each, players at + 0x80), their count, and the chosen
+		// one's number.
+		constexpr std::uintptr_t FrontEndMapRecords = 0x657C;
+		constexpr std::uintptr_t FrontEndMapRecordCount = 0x6604;
+		constexpr std::uintptr_t FrontEndChosenMapRecord = 0x6608;
+		// Front end: the window titles' pictures (0x28 bytes each, by the title widget's text id field, button config + 0x40; the map list's is 9, text 2800),
+		// their second pictures, and their sizes (4 ints each), as the title draw (0x536700) reads them.
+		constexpr std::uintptr_t FrontEndTitleImages = 0x360C;
+		constexpr std::uintptr_t FrontEndTitleImages2 = 0x39A4;
+		constexpr std::uintptr_t FrontEndTitleSizes = 0x3D3C;
+		// Front end: a byte; while it is 1 to 3 the chosen map's preview picture is drawn (widget 687's draw, 0x537C30).
+		constexpr std::uintptr_t FrontEndPreviewShown = 0x30C1E;
+		// Front end: what the picture draw (0x52CF90) is called on (thiscall's object).
+		constexpr std::uintptr_t FrontEndPictureDrawer = 0x30D3F;
+		// Front end: two flags copied from a level's details (bits 5 and 6 of its flags word, + 0x64C0) when the front end
+		// reads them (0x535C30), 0 before any level is read. While either is set the briefing window is the short one: its
+		// title shows only text 1 (else "text 0" - text 1, 0x53A41D) and the sub objective box is left out (0x53ADB2).
+		// After playing Secret1 one was set [verified in game].
+		constexpr std::uintptr_t FrontEndShortBriefing = 0x311B6;
+		constexpr std::uintptr_t FrontEndShortBriefing2 = 0x311BA;
+		// Front end: the chosen map's name (wide, 0x40 characters), which starting a skirmish copies into the level name.
+		constexpr std::uintptr_t FrontEndChosenMap = 0x6580;
 		// Interface: while set, the key event only takes Escape. What holds the bridge (+ 0x10 in it).
 		constexpr std::uintptr_t InterfaceKeysHeld = 0x10E2;
 		constexpr std::uintptr_t InterfaceOwner = 0x4;
@@ -1119,6 +1585,10 @@ constexpr std::uintptr_t WorldGameSeed = 0x15A0;
 		constexpr std::uintptr_t CreatureOwner = 0x28;
 		constexpr std::uintptr_t CreatureData = 0x370;
 		constexpr std::uintptr_t CreatureDataFlags = 0x686;
+		// Creature data: the bed object (Objects.kwd id, 0 = none: the royals, Imps, Skeletons, Horny)
+		constexpr std::uintptr_t CreatureDataLairObject = 0x771;
+		// A creature's state block (creature + 0x24E): the creature itself
+		constexpr std::uintptr_t StateBlockCreature = 0x8;
 		// Creature's hero job (0 = none; run by 0x478800 from the hero idle 0x477850) and the player it is aimed at
 		constexpr std::uintptr_t CreatureGoodJob = 0x409;
 		constexpr std::uintptr_t CreatureGoodJobPlayer = 0x40D;
@@ -1173,6 +1643,16 @@ constexpr std::uintptr_t WorldGameSeed = 0x15A0;
 		constexpr std::uintptr_t BoxPieceSides = 0x81;
 		constexpr std::uintptr_t BoxPieceInUse = 0xD5;
 		constexpr std::uintptr_t BoxPiecePosition = 0xD6;
+		// Any bridge thing's position: x, y, z, 32-bit, 4096 per tile (0x446C70 takes the tile as >> 12).
+		constexpr std::uintptr_t BridgeThingPosition = 0xD6;
+		// The bridge's lights (Flame: CLight, 0x146 bytes, made by 0x4397E0 and set up by 0x43A1E0): the first at bridge
+		// + 0x33A, each one's next at + 0x13C. A light's color now (three 16-bit 0-255; + 0x11F holds the one it was made
+		// with), its reach (32-bit, 4096 per tile, at most 0x2780) and strength (a byte, 128 by default).
+		constexpr std::uintptr_t BridgeLights = 0x33A;
+		constexpr std::uintptr_t LightNext = 0x13C;
+		constexpr std::uintptr_t LightColor = 0x111;
+		constexpr std::uintptr_t LightRadius = 0x117;
+		constexpr std::uintptr_t LightStrength = 0x145;
 		constexpr std::uintptr_t BoxPiecePlaced = 0x100;
 		// An engine thing's tint: three color bytes and 255, set white or to an owner's color as the game sets a thing up
 		// (0x436317, 0x43639B) [verified: the stores; that the box piece is drawn with it is unverified].
@@ -1185,11 +1665,67 @@ constexpr std::uintptr_t WorldGameSeed = 0x15A0;
 		// In the global settings (GlobalSettingsPointer): the most health percent table, 16 bit by level.
 		constexpr std::uintptr_t SettingsLevelHealthPercent = 0xE1;
 		constexpr std::uintptr_t CreatureFlags = 0x3E6;
+		// Possession actions (docs/game/possession.md). A creature: hunger (32 bit, state block + 0x4C), sleep left (32
+		// bit, state block + 0x58), its bed object's tag, prison holder (the player whose Prison or pit holds it), attack
+		// target, when its melee last hit (game turn), the possessed creature it follows, and (on the possessed one) its
+		// number of followers (32 bit).
+		constexpr std::uintptr_t CreatureHunger = 0x29A;
+		// A player's gold (32 bit); the world's player events (passed to PlayerEvent).
+		constexpr std::uintptr_t PlayerGold = 0x7E;
+		constexpr std::uintptr_t WorldEvents = 0x2E54;
+		// Experience toward the next level (32 bit; 0x457880 adds to it and levels up at the mark).
+		constexpr std::uintptr_t CreatureExperience = 0x3FF;
+		// A shot: the tag of the thing that cast it, and "cast by a possessed creature" (32 bit).
+		constexpr std::uintptr_t ShotCastBy = 0x145;
+		constexpr std::uintptr_t ShotCastByPossessed = 0x151;
+		constexpr std::uintptr_t CreatureSleepLeft = 0x2A6;
+		constexpr std::uintptr_t CreatureBed = 0x3B7;
+		constexpr std::uintptr_t CreaturePrisonHolder = 0x3CB;
+		constexpr std::uintptr_t CreatureAttackTarget = 0x3F9;
+		constexpr std::uintptr_t CreatureFollowing = 0x482;
+		constexpr std::uintptr_t CreatureFollowerCount = 0x488;
+		// Creature data: its sleep length (32 bit, what sleep left is set to when it gets tired) and its Training Room
+		// experience per second at level 1 (16 bit; other levels scale it by the settings' table below, in percent).
+		constexpr std::uintptr_t CreatureDataSleepLength = 0x5D6;
+		constexpr std::uintptr_t CreatureDataTrainingExperience = 0x6B9;
+		constexpr std::uintptr_t SettingsLevelTrainingPercent = 0x1EF;
+		// The world's "thing in front of the possessed creature" (vtable), thiscall (world, creature, position, angles),
+		// ret 0xC: a tag.
+		constexpr std::uintptr_t WorldThingInFront = 0x334;
+		// A room's things (first tag; a thing's next is at + 0x12A). A Prison: its door's tile (x, y, 32 bit each), the
+		// bar lifted (32 bit), the door open (32 bit), the countdown to closing it (byte, room ticks).
+		constexpr std::uintptr_t RoomFirstThing = 0xE;
+		constexpr std::uintptr_t ThingNextInRoom = 0x12A;
+		constexpr std::uintptr_t PrisonDoorX = 0x51;
+		constexpr std::uintptr_t PrisonBarLifted = 0x59;
+		constexpr std::uintptr_t PrisonDoorOpen = 0x5D;
+		constexpr std::uintptr_t PrisonDoorCountdown = 0x61;
 		// Input system: the DirectInput mouse (its device part is 0x10 in) and the mouse's position object.
 		constexpr std::uintptr_t InputMouseDevice = 0x5C;
 		constexpr std::uintptr_t InputKeyboardDevice = 0x58;
 		constexpr std::uintptr_t InputDevicePart = 0x10;
 		constexpr std::uintptr_t InputMouse = 0x64;
+		// Input system: the control keys object, which the DirectInput mouse hands its events to (0x5BC060 gives it to the mouse) [verified].
+		constexpr std::uintptr_t InputControlKeys = 0x60;
+		// Its vtable's listener calls for movement and button events.
+		constexpr std::uintptr_t ListenerMouseMove = 0x14;
+		constexpr std::uintptr_t ListenerMouseButton = 0x18;
+		// An input event (0x5DDA90): its time (ms), "not handled yet" (1 until the game takes it from its queue),
+		// movement: axis (0 x, 4 y, 8 wheel) and amount; button: key (0xF0 left, 0xF1 right, 0xF2 middle, 0xF3 other),
+		// a point (0, 0), the DirectInput data byte (0x80 pressed) and flags (8 pressed; 1, 2, 4 Shift, Ctrl, Alt).
+		constexpr std::uintptr_t InputEventTime = 0x4;
+		constexpr std::uintptr_t InputEventPending = 0x8;
+		constexpr std::uintptr_t MouseMoveAxis = 0xC;
+		constexpr std::uintptr_t MouseMoveAmount = 0x10;
+		constexpr std::uintptr_t MouseMoveEventSize = 0x14;
+		constexpr std::uintptr_t MouseButtonKey = 0x10;
+		constexpr std::uintptr_t MouseButtonData = 0x1C;
+		constexpr std::uintptr_t MouseButtonFlags = 0x20;
+		constexpr std::uintptr_t MouseButtonEventSize = 0x24;
+		// Player interface: in a menu (int; Flame's inMenu, read by the mouse handler 0x4065C1), and the mouse turns or zooms the view (int, set while key
+		// action 0x2B or 0x2C is held, 0x406AE4; the view then moves by the mouse's movement, 0x5B2BB0) [verified].
+		constexpr std::uintptr_t InterfaceInMenu = 0x2722;
+		constexpr std::uintptr_t InterfaceMouseLook = 0x13CB;
 		// DirectInput device part: the cooperative flags wanted, and the window it last set them for.
 		constexpr std::uintptr_t InputDeviceFlags = 0x4;
 		constexpr std::uintptr_t InputDeviceWindow = 0x18;
@@ -1282,6 +1818,9 @@ constexpr std::uintptr_t WorldGameSeed = 0x15A0;
 	constexpr std::uint32_t FirstKeeperPlayer = 3;
 	constexpr std::uint8_t LocalPlayerChosenFlag = 0x80;
 	constexpr std::uint8_t GoodPlayer = 1;
+	// Object types (ObjectType): an egg (laid in a Hatchery, hatches into a chicken, type 9).
+	constexpr std::uint8_t ObjectEgg = 0x2F;
+	constexpr std::uint8_t ObjectChicken = 9;
 	constexpr std::uint8_t CreateImpSpell = 4;
 	constexpr std::uint32_t SpellAvailable = 3;
 	// States in the room, door, trap and spell availability lists
@@ -1297,6 +1836,8 @@ constexpr std::uintptr_t WorldGameSeed = 0x15A0;
 	// Mercenary Portal. Also read when the interface picks "the" Imp type (first type with both) and by 0x4E8C60.
 	constexpr std::uint32_t CreatureImpDropFlag = 0x80;
 	constexpr std::uint8_t PartyFollowerFlag = 4;
+	// The action kind of "exit to Windows" (the in-game confirmation's yes, 0x4205B0, sends it with this player's tag).
+	constexpr std::int32_t ActionExitToWindows = 0x7D;
 	constexpr std::int32_t PlayModeCampaign = 1;
 	constexpr std::int32_t PlayModeSkirmish = 2;
 	constexpr std::int32_t PlayModeMultiplayer = 3;

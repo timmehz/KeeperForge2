@@ -65,6 +65,16 @@ present in the new place are not overwritten. It logs what it moved.
     (default `smaa x4`). FXAA and SMAA: x2/x4/x8 are the low/high/ultra presets;
     MSAA: samples per pixel, lowered to what the card supports. Unknown words give
     `smaa x4` and are rewritten. See [game/renderer.md](../game/renderer.md).
+  - `keeper_color_red`, `keeper_color_blue`, `keeper_color_green`, `keeper_color_yellow`, `keeper_color_purple` —
+    each keeper's color, six hex digits (RRGGBB) or `game` (default) for the game's own; set by the color boxes beside
+    the skirmish screen's player list. See [game/keeper-colors.md](../game/keeper-colors.md).
+  - `ray_tracing` — `on` or `off` (default `off`): ray traced ambient occlusion, shadows, reflections (water and
+    lava) and bounce light, with every renderer (KeeperForge2's own tracer in compute shaders). The log's lines
+    starting `Ray tracing:` say what runs and what the card offers. Its parts: `ray_tracing_occlusion`,
+    `ray_tracing_shadows`, `ray_tracing_reflections` and `ray_tracing_bounce`, `on` or `off` (all `on`);
+    `ray_tracing_quality` — `high`, `medium` (default) or `low`: traced at a half, a third or a quarter of the
+    screen's size; `ray_tracing_rate` — traces a second, 5 to 240 or 0 for every frame (default 30; frames between
+    show the last result, lower is lighter). See [game/ray-tracing.md](../game/ray-tracing.md).
   - `cpu_threads` — how many CPU threads the game may use: a number (default 4),
     `all`, or `game` for the original 1. See [game/cpu-threads.md](../game/cpu-threads.md).
   - `panel_key_creatures`, `panel_key_rooms`, `panel_key_spells`,
@@ -80,6 +90,21 @@ present in the new place are not overwritten. It logs what it moved.
   - `middle_click_camera_reset` — `on` (default): the middle mouse button
     puts the view's zoom and rotation back as they were at the level's start,
     without moving it. Same doc as above.
+  - `windows_mouse` — `on` (default, as in Flame): the game takes its mouse
+    from Windows' messages instead of DirectInput, so the pointer moves at
+    Windows' pointer speed and acceleration, without lag, and at the same
+    speed at any resolution (DirectInput's moved it a fixed number of pixels,
+    slow at 4K). The pointer is held to the game's window while it is in
+    front. Needs `dx11`, `dx12` or `vulkan`. `off` uses the game's own
+    DirectInput mouse. See [game/mouse.md](../game/mouse.md).
+  - `title_screen_ms` — how long the title screen shows at start, 0 to 10000
+    milliseconds (default `600`; the game's own is 10000). A key or click
+    skips it. See [game/game-fixes.md](../game/game-fixes.md).
+  - `wide_zoom` — `on` (default): the view zooms further out and a little
+    closer than the game allows. See [game/camera-controls.md](../game/camera-controls.md).
+  - `autosave` — minutes of play between autosaves in single player (default
+    `5`, 1 to 600), or `off`. `autosave_keep` — how many autosaves to keep
+    (default `3`). See [game/autosave.md](../game/autosave.md).
   - `run_in_background` — `on` (default) keeps the game running when it is
     minimized or loses focus (dx11, dx12, vulkan only); while unseen its
     sound is muted and campaign and skirmish run at 1 fps. `off` pauses as

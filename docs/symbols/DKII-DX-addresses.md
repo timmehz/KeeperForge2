@@ -77,6 +77,10 @@ and the patch is skipped instead of corrupting code.
 | PlayerActionTick | 0x4C0AA0 | runs/finishes the player's timed action (+0x186), thiscall | [verified] |
 | WorldPointer | 0x6E5054 | pointer to the world object | [verified] |
 | ThingTable | 0x6EE540 | thing pointers by tag | [verified] |
+| EggTick | 0x4A21C0 | egg's object state 0x18 (sits, thrown at 4 s, rolls): fastcall (egg), 0 when it removed the egg | [verified] |
+| EggHatch | 0x4A1CF0 | egg's object state 0x20: makes a chicken at the egg, fastcall (egg) | [verified] |
+| ThingSetPosition | 0x4B5560 | moves a thing, relinking its tile list: thiscall (thing, position) ret 4 | [verified] |
+| TileFloorHeight | 0x4545C0 | floor height at a position on a tile: thiscall (tile, position) ret 4 | [verified] |
 | PlayerSpellState / SetPlayerSpellState | 0x4BAFA0 / 0x4BAF40 | per-player keeper spell state (3 = available) | [verified] |
 | CastKeeperSpell | 0x4BBD30 | thiscall (player, spell, position, flag) ret 0xC | [verified] |
 | PlayerInterfaceSetup | 0x419180 | thiscall (interface); picks the Workers row type (+0x123) | [verified] |
@@ -122,6 +126,45 @@ and the patch is skipped instead of corrupting code.
 | DropActionDropCall / PlayerDropAt | 0x4C0F70 / 0x4BC710 | the drop action's call of the player's drop, thiscall (player, int position[3], u16* direction) ret 8 | [verified] |
 | InterfaceDropAllowed | 0x40D8F0 | drop rules, thiscall (interface, thing, tile x, tile y) ret 0xC; reads only interface + 8 (player tag) and + 0x53 (world) | [verified] |
 | HeartWarningCompare | 0x4D9ACB | in the Heart room tick 0x4D9A60 (raw bytes): "cmp eax, 50; jnz" on health percent, 50% event 0x27 at 0x4D9AD0, 10% check at 0x4D9AE2 (event 0x28) | [verified] |
+| LoadPngPicture | 0x59A4B0 | cdecl (name): loads a PNG, returns a 40-byte picture record (masks, bits per pixel, pixels, width + 0x1C, height + 0x20, pitch) or 0 when missing; one caller, 0x5912D3 | [verified] |
+| RoomTileMeshes | 0x443610 | thiscall (bridge, x, y, tile, terrain data, mesh arrays) ret 0x14: a room tile's meshes, room from ThingTable[(tile + 2) & 0xFFF] (as 0x4559B0), unchecked; called at 0x43E3E0 | [verified] |
+| SaveLoadPathBuild / SaveLoadPathUse | 0x52555E / 0x5255CD | loading a saved game: the path built into 64-byte stack buffers (0x51 bytes, resume 0x5255AF), and "lea eax, [esp+0x114]" handing it to the loader 0x50E920 | [verified] |
+| GameConfigSaveName / SavesFolder | 0x75ADD7 / 0x758754 | the save to load (wide; game config 0x75AD47 + 0x90, 0x55D550 returns it) and the saves folder (full path, text) | [verified] |
+| InterfacePushAction | 0x4346E0 | the player interface's push of an action, thiscall (interface, action) ret 4; session at interface + 4 (0 with no game) | [verified] |
+| ActionExitToWindows | 0x7D | action kind sent by the in-game "exit to Windows" confirmation (0x4205B0), player tag at + 0x10 | [verified] |
+| TextInputConfigure | 0x52AA10 | a text input's configure, thiscall (button, config) ret 4: limit (+ 0x280) from config + 0x1A; typing (0x52C40E) allows limit - 1 characters | [verified] |
+| SessionListVersionDone / SessionListJoinableDone | 0x54D548 / 0x54D58C | in the session list 0x54D370 (raw bytes): version text done ([esp + 0x30]); joinable byte written (via [esp + 0x10]); resume 0x54D54D / 0x54D595 | [verified] |
+| SessionCount / SessionArray | 0x73FE74 / 0x73FE78 | found multiplayer sessions, 0xA4 bytes each (see game-fixes.md) | [verified] |
+| GameVersionMajor / GameVersionMinor / GameFileCheck | 0x6BC430 / 0x6BC434 / 0x7962A0 | this game's version and file check, compared with each session's | [verified] |
+| SessionMapLookup | 0x53ED60 | thiscall (front end, map info, wide name out) ret 8: 1 when the session's map is ours | [verified] |
+| GameStartupCall / GameStartup | 0x64780B / 0x5A5DA0 | the game's start-up, cdecl (argc, argv); mutex "DKII MUTEX" via 0x5BAE70 | [verified] |
+| Startup...Call | 0x5A5FAC, 0x5A5FBC, 0x5A60DB, 0x5A6187, 0x5A6199, 0x5A61D0, 0x5A61F8 | the start-up's calls of command line 0x5A63B0, fonts 0x552F10, window 0x557CB0, speech 0x567F90, network 0x559BE0, Windows check 0x557FB0, components 0x552BE0 (0 = failed) | [verified] |
+| WindowsCheckMajorPush | 0x557FB4 | in the Windows check 0x557FB0: "push 6", the Windows major version the game refuses from (0x557FD0 compares with GetVersionExA) | [verified] |
+| ThreatPickLastTest / ThreatPickOwnedTest | 0x4FE504 / 0x4FE544 | in the threat response 0x4FE0B0: the pick loop's last test (next 0x4FE50D, picked 0x4FE522) and the "is it the keeper's" test (0x48E6A0; owned 0x4FE54C, not 0x4FE914) | [verified] |
+| CreatureRecordConvert | 0x568E30 | thiscall (type, record) ret 4: a creature list record (0x1549 bytes) into the game's own type; called by the reader at 0x56A41A | [verified] |
+| TitleScreenWait / GameTimeMs | 0x5341D8 / 0x5B5E90 | the title screen's 10 s wait loop (to 0x5341F6, resume 0x5341F7); the game's millisecond clock, cdecl | [verified] |
+| FrontEndWindowList (offset) | + 0x30FCE | the front end's menu window list; per window: id + 0x44, shown flag + 0x48, next + 0x62 (as the lookups 0x5322D0 and 0x52C540 walk it); + 0x6016 is only where the map list was opened from | [verified] |
+| FrontEndComponent / FrontEndMenuAction | 0x70D6D8 / 0x5306F0 | the menus; their action handler, cdecl (argument, action, front end): 0x58 map list, 0x5A start skirmish, 0x18 leave skirmish, 0x4E/0x4F map list tick/cross | [verified] |
+| SkirmishMapList / SkirmishMapListCount / MapListChosenRow | 0x740354 / 0x6B442C / 0x740348 | the skirmish map list text (4 fields per map, 0-ended, 0xFFFF last), its count (-1 recount), the clicked row | [verified] |
+| FrontEndChangeWindow | 0x5391F0 | cdecl (0 hide / 1 show, window, front end); window 7 is the briefing (tick 0x0C, cross 0x0A) | [verified] |
+| SkirmishScreenStep | 0x538AC0 | cdecl (front end): shows window 9 and runs action 0x15, once the camera reaches the skirmish screen; the same function as SkirmishSetup, hooked by SkirmishSwapKeeper, which calls CustomCampaign | [verified] |
+| MapListBackground | 0x7401F0 | the skirmish map list's background picture record (size column tinted green); width + 0x1C, height + 0x20, pitch + 0x24 as the picture draw 0x52CF90 reads them | [verified] |
+| MapListRowHighlight | 0x740218 | the map list's row highlight picture record (chosen and pointed rows; green over the size column) | [verified] |
+| MapListDetails | 0x540600 | the chosen map's details draw, cdecl (widget, front end): name banner, "Max Players : %s" (text 0x5D4) from field 2, field 3; hooked by CustomCampaign | [verified] |
+| PictureDraw / ImageFree | 0x52CF90 / 0x5B5310 | draw a picture record into a frame, thiscall (front end + 0x30D3F; out, frame, x, y, picture, area, 0), no scaling; free a record's pixels, fastcall (record) | [verified] |
+| EngineCamera* | 0x760AB8 / 0x760AC4 / 0x760AE8 / 0x760AFC / 0x760B00 | the engine's camera as it last drew the world (0x575A00): position, rotation (row major, view to world), focal length, projection middle | [verified] |
+| Bridge lights (offsets) | + 0x33A, light + 0x13C / + 0xD6 / + 0x111 / + 0x117 / + 0x145 | the bridge's light list (Flame: CLight), next, position (4096 per tile), color, reach, strength; bridge vtable 0x66CC94 | [verified] |
+| BriefingWindowConfig / BriefingButtons | 0x6AEF38 / 0x6AEF80 | the briefing window's (7) config and button list (title 161, boxes 162/165/168, headings 164/167, cross 169, tick 170) | [verified] |
+| FrontEndShortBriefing (offsets) | + 0x311B6 / + 0x311BA | flags from the last level read (0x535C30); either set gives the short briefing (no sub objectives) | [verified] |
+| TitleBake / ImageCreate / ImageAllocate | 0x536370 / 0x5B5270 / 0x5B52C0 | menu title pictures: draw a text into two picture records (thiscall (front end; packed settings)); set up a 0x28-byte picture record; give it pixels. Titles live at front end + 0x360C / + 0x39A4 (0x28 each), sizes + 0x3D3C (0x10 each); made by 0x536850 from the text ids at 0x6B8468 | [verified] |
+| FrontEndPreviewShown (offset) | + 0x30C1E | byte; the chosen map's preview (widget 687, 0x537C30) draws while it is 1 to 3 | [verified] |
+| (menu button click) | 0x528610 | calls the button's action (config + 0x16, + 0x1A), hides its window if config + 0x12, shows config + 0xE; the Single Player menu's click 0x538000 hides/shows by its first argument's words | [verified] |
+| BriefingText | 0x553AC0 | cdecl (id): the level's briefing table text (0/1 name, 2 objective, 3 briefing, 4-5 more; meanings from layout) | [verified code] |
+| MapListClick | 0x5416E0 | cdecl (row, ?, front end): stores the row, loads that map's preview | [verified] |
+| SoundThreadStopWait | 0x60D64A | in the sound list thread's stop 0x60D630: busy wait for + 0x38 (stopped), 14 bytes, ESI the object; resume 0x60D658 | [verified] |
+| HeroPartySpawnFailTest | 0x51A274 | in the hero party spawn 0x519F90 (thiscall (world, party, action point, invasion flag) ret 0xC): "test eax, eax; jz" after a member's spawn (0x519B20, 0 when the world is full); next member 0x51A27C | [verified] |
+| HeroPartyFinish | 0x51A5E2 | the party's finish code after the member loop (same stack as the loop); leader pointer at [esp + 0x88], returns 1 at 0x51A747 | [verified] |
+| HeroPartyLeaderEffect / HeroPartyLeaderPlace | 0x51A66A / 0x51A73A | the finish code's uses of the leader: effect 0x2B at it (resume 0x51A672, skip 0x51A6CF), its place in the party (+ 0x3E1) | [verified] |
 | TaskSlotHolder / TaskSetSlotHolder | 0x508110 / 0x508160 | a dig or gold task's slot (3 per face, 4 faces): read, thiscall (list, task, face, slot) ret 0xC; set, (list, task, face, slot, tag) ret 0x10 | [verified] |
 | DigSearchSlotRead / GoldSearchSlotRead | 0x469D34 / 0x46A1B6 | the worker job search's slot reads (calls to 0x508110) | [verified] |
 | NeutralPlayerTag | 0x6F2548 | the neutral player's tag (16 bit) | [verified] |
@@ -146,3 +189,34 @@ and the patch is skipped instead of corrupting code.
 | LobbyChatDraw | 0x544FA0 | lobby chat drawing, cdecl (button, front end); CreatorName hooks it to add notices | [verified] |
 | TextColorSet | 0x62C3C0 | thiscall (out, color) ret 8: sets the text color { B, G, R, A, palette } of the text drawer at 0x7413C0 | [verified] |
 | LobbySlots | 0x73F5C8 | lobby slots, 0x3F bytes each: a human player's wide name at + 0, kind in the low 3 bits of + 0x3A (0 empty, 1 computer) | [verified] |
+| InputInitMouse | 0x5BC060 | thiscall (input system, int* result) ret 4: makes the DirectInput mouse; WindowsMouse skips it (game/mouse.md) | [verified] |
+| InputWindowActivated | 0x5BC210 | thiscall (input system, int* result, active) ret 8: keyboard's and mouse's active flag (0x5DCCA0), then 0x5BC3A0; no check for a missing mouse | [verified] |
+| MouseMoveEventVtable, MouseButtonEventVtable | 0x672900, 0x6728F8 | the mouse's movement (0x14 bytes) and button (0x24 bytes) input events | [verified] |
+| ControlKeysVtable | 0x672888 | the control keys object (input system + 0x60): + 0x14 movement (0x5BB660), + 0x18 button (0x5DD010) | [verified] |
+| MouseSensitivity | 0x759C21 | the options menu's mouse sensitivity (int) | [verified] |
+| PossessedAttackAction | 0x514830 | the possessed creature's attack action, thiscall (world, action) ret 4; data3 bit 0x8000000 a melee hit (game/possession.md) | [verified] |
+| StopPossessionAction | 0x514590 | leaving a creature, action handler thiscall (world, action) ret 4; reads only the player tag | [verified] |
+| WorldThingInFront (vtable) | world + 0x334 (0x515420) | the thing in front of the possessed creature, thiscall (world, creature, position, angles) ret 0xC | [verified] |
+| CreatureMeleeReady | 0x48C9B0 | the creature's melee is ready, thiscall (creature, creature data) ret 4 | [verified] |
+| CreatureAddExperienceCapped | 0x4858B0 | adds experience up to the next level, thiscall (creature, amount) ret 4 (0x457880 adds without the cap) | [verified] |
+| StateBlockSetState | 0x476D30 | sets a state, thiscall (state block, state, value) ret 8 | [verified] |
+| StateBlockGoToBed | 0x46F440 | sends a creature with sleep left to its bed, thiscall (state block) | [verified] |
+| StateBlockFollow | 0x461980 | starts following a possessed creature (state 0xF6), thiscall (state block, leader tag) ret 4 | [verified] |
+| CreatureSetAttackTarget / CreatureClearAttackTarget | 0x48F390 / 0x48F3F0 | attack target (+ 0x3F9, bit 4 of + 0x3E6): set, thiscall (creature, tag) ret 4; clear, thiscall (creature) | [verified] |
+| PrisonToggleDoor | 0x4E35C0 | opens or closes a Prison's door by its state, thiscall (room) | [verified] |
+| ObjectSetAnimation | 0x49EF60 | an object's animation, thiscall (object, animation) ret 4 | [verified] |
+| TurnsPerSecond | 0x6F2590 | byte the game uses as turns per second (Prison door countdown, once-a-second work) | [verified] |
+| MaxTrainingLevel | 0x6F28FC | byte: the Training Room trains up to this level | [verified] |
+| ObjectTurn | 0x49BD20 | an object's turn (object vtable + 0x14), thiscall (object): its state (0x49EED0), then its move (0x4B2030) | [verified] |
+| PossessedShotTrainingEffect | 0x4ABE54 | in a shot's flight: the effect call (call [edx + 0x38C]) when a possessed creature's shot finds a Training Target; check at 0x4ABE28 | [verified] |
+| PossessedTargetFilter / PossessedTargetReach | 0x516050 / 0x5162E0 | what the thing-in-front search keeps (thiscall (world, creature, thing, flag) ret 0xC) / the reach test (thiscall (world, creature, thing) ret 8) | [verified] |
+| TrainingCostPerSecond | 0x6F291D | training's gold a second (signed 16 bit, stored negative) | [verified] |
+| PlayerTakeGold | 0x4BA420 | a player's gold change, thiscall (player, amount, direct, tile x, tile y) ret 0x10; negative with direct 0 comes from Treasuries and Heart | [verified] |
+| ShowMoneyText (arguments) | 0x50FB70 | its four arguments: owner tag, position, amount, 0 (the Training Room shows its gold this way); LevelEditor also hooks it | [verified] |
+| PlayerEvent | 0x4C4600 | a player event, thiscall (world + 0x2E54, event, tag, value, value, value) ret 0x14; 0x37 not enough gold to train | [verified] |
+| PossessedThingInFront | 0x515420 | the thing-in-front search (world vtable + 0x334), thiscall (world, creature, position, angles) ret 0xC | [verified] |
+| GameAngle | 0x65FB54 | angle of a direction, cdecl (dx, dy), 0 to 0x7FF, table based | [verified] |
+| TileTakesPrisoners | 0x454110 | whether a room tile takes what the room holds, thiscall (tile); a Prison wants tile + 0xC = -1 (not its edge or door tile) | [verified] |
+| StateBlockWalkTo | 0x471890 | walk somewhere, thiscall (state block, position, state on arrival, walking rules) ret 0xC | [verified] |
+| DirectionTableX / DirectionTableY | 0x6C1488 / 0x6C1C88 | direction tables (16.16 by angle 0 to 0x7FF): a heading's step across, and down (negated) | [verified] |
+| PossessedRangedInFront | 0x515520 | the ranged abilities' target search (world vtable + 0x338), thiscall (world, creature, position, angles, flag) ret 0x10 | [verified] |

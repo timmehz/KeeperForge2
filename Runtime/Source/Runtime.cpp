@@ -7,15 +7,19 @@
 #include "HookManager.h"
 #include "ModManager.h"
 #include "ModApiHost.h"
+#include "Autosave.h"
 #include "BackgroundRunning.h"
 #include "Bans.h"
 #include "CameraControls.h"
 #include "ConsoleCommands.h"
 #include "CoopCampaign.h"
+#include "CustomCampaign.h"
+#include "KeeperColors.h"
 #include "CpuThreads.h"
 #include "CrashHandler.h"
 #include "CreatureCountInput.h"
 #include "CreatureFixes.h"
+#include "PossessionActions.h"
 #include "SoundLog.h"
 #include "ModData.h"
 #include "ModCheck.h"
@@ -28,6 +32,7 @@
 #include "LevelEditor.h"
 #include "MemoryWatch.h"
 #include "MercenaryPortal.h"
+#include "ModelDetail.h"
 #include "ModerationCommands.h"
 #include "Notices.h"
 #include "MenuVersionText.h"
@@ -40,6 +45,7 @@
 #include "SkirmishSwapKeeper.h"
 #include "SteamMultiplayer.h"
 #include "Widescreen.h"
+#include "WindowsMouse.h"
 
 namespace {std::atomic_bool initialized{ false };}
 namespace KeeperForge2 {
@@ -71,6 +77,7 @@ namespace KeeperForge2 {
         FrameRate::Initialize();
         BackgroundRunning::Initialize();
         Screenshots::Initialize();
+        Autosave::Install();
         MenuVersionText::Install();
         SkirmishSwapKeeper::Install();
         CreatureCountInput::Install();
@@ -81,14 +88,22 @@ namespace KeeperForge2 {
         MercenaryPortal::Install();
         // Has a level start callback (the middle click camera reset), so before CoopCampaign.
         CameraControls::Install();
+        // After Renderer (it needs to know our renderer will watch the window), before the game sets up its mouse.
+        WindowsMouse::Install();
         // Mods' level start events (ModApi.h), before CoopCampaign's.
         ModApiHost::Install();
         // After the features that run at level start: its callback has to be the last.
         CoopCampaign::Install();
         LevelEditor::Install();
+        // After CoopCampaign (it checks the bytes of the player result function this hooks).
+        CustomCampaign::Install();
+        // After SkirmishSwapKeeper and CoopCampaign: its button joins theirs on the skirmish screen.
+        KeeperColors::Install();
         GuiTextCache::Install();
         CreatureFixes::Install();
+        PossessionActions::Install();
         GameFixes::Install();
+        ModelDetail::Install();
         SoundLog::Install();
         CombatPitLog::Install();
         PanelKeys::Install();

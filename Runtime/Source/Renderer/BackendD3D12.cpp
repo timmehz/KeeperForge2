@@ -1,12 +1,16 @@
 #include "Backend.h"
 #include "ShaderSources.h"
+#include "RayHlsl.h"
+#include "Config.h"
 #include "Logger.h"
+#include "StringUtils.h"
 #include <Windows.h>
 #include <d3d12.h>
 #include <d3dcompiler.h>
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 #include <algorithm>
+#include <unordered_set>
 #include <climits>
 #include <cstdio>
 #include <cstring>
@@ -68,13 +72,13 @@ namespace KeeperForge2::Render {
 			heap.Type = type;
 			return heap;
 		}
-		D3D12_RESOURCE_DESC TextureDescription(UINT width, UINT height, DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags) {
+		D3D12_RESOURCE_DESC TextureDescription(UINT width, UINT height, DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags, UINT16 levels = 1) {
 			D3D12_RESOURCE_DESC description{};
 			description.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
 			description.Width = width;
 			description.Height = height;
 			description.DepthOrArraySize = 1;
-			description.MipLevels = 1;
+			description.MipLevels = levels < 1 ? 1 : levels;
 			description.Format = format;
 			description.SampleDesc.Count = 1;
 			description.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
@@ -103,6 +107,43 @@ namespace KeeperForge2::Render {
 				const char* Name() const override { return "DirectX 12"; }
 				bool FlipsY() const override { return false; }
 
+				// ray_tracing: on (first step): whether this 32-bit process gets the card's ray tracing (DXR) through DirectX 12.
+				// Only reads and logs; nothing is turned on.
+				void ProbeRayTracing() {
+					const LUID luid = device->GetAdapterLuid();
+					std::string adapterName = "the default adapter";
+					using CreateFactoryFn = HRESULT(WINAPI*)(REFIID, void**);
+					if (HMODULE dxgi = LoadLibraryW(L"dxgi.dll")) {
+						if (const auto createFactory = reinterpret_cast<CreateFactoryFn>(GetProcAddress(dxgi, "CreateDXGIFactory1"))) {
+							Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
+							Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+							DXGI_ADAPTER_DESC1 description{};
+							if (SUCCEEDED(createFactory(IID_PPV_ARGS(&factory))) && SUCCEEDED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter)))
+								&& SUCCEEDED(adapter->GetDesc1(&description))) {
+								char name[128]{};
+								WideCharToMultiByte(CP_UTF8, 0, description.Description, -1, name, static_cast<int>(sizeof(name)) - 1, nullptr, nullptr);
+								adapterName = name;
+							}
+						}
+					}
+					D3D12_FEATURE_DATA_D3D12_OPTIONS5 options5{};
+					const HRESULT result = device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &options5, sizeof(options5));
+					if (FAILED(result)) {
+						Logger::Info("Ray tracing: DirectX 12 on " + adapterName + " (32-bit process) cannot answer the ray tracing question (this Windows "
+							"or driver is too old for it), so no DXR.");
+						return;
+					}
+					const int tier = static_cast<int>(options5.RaytracingTier);
+					const std::string tierName = tier >= D3D12_RAYTRACING_TIER_1_1 ? "1.1 (inline ray queries)" : tier >= D3D12_RAYTRACING_TIER_1_0 ? "1.0" : "none";
+					Microsoft::WRL::ComPtr<ID3D12Device5> device5;
+					const bool hasDevice5 = SUCCEEDED(device.As(&device5));
+					Logger::Info("Ray tracing: DirectX 12 on " + adapterName + " (32-bit process): DXR tier " + tierName + ", ID3D12Device5 "
+						+ (hasDevice5 ? "yes" : "no") + ".");
+					Logger::Info(std::string("Ray tracing: ") + (tier >= D3D12_RAYTRACING_TIER_1_1 && hasDevice5
+						? "this card can ray trace for KeeperForge2 through DirectX 12 (inline ray queries)."
+						: "this card or driver does not offer DXR 1.1 to this 32-bit game through DirectX 12."));
+				}
+
 				bool Init(HWND target) override {
 					window = target;
 					HMODULE library = LoadLibraryW(L"d3d12.dll");
@@ -112,6 +153,7 @@ namespace KeeperForge2::Render {
 					if (!createDevice || !serializeRootSignature) return Fail("is missing its entry points", E_NOINTERFACE);
 					HRESULT result = createDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device));
 					if (FAILED(result)) return Fail("found no device", result);
+					if (StringUtils::ToLower(Config::GetString("ray_tracing", "off")) == "on") ProbeRayTracing();
 					D3D12_COMMAND_QUEUE_DESC queueDescription{};
 					queueDescription.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
 					if (FAILED(result = device->CreateCommandQueue(&queueDescription, IID_PPV_ARGS(&queue)))) return Fail("could not make a queue", result);
@@ -206,11 +248,12 @@ namespace KeeperForge2::Render {
 					return true;
 				}
 
-				std::uint32_t CreateTexture(std::uint32_t width, std::uint32_t height) override {
+				std::uint32_t CreateTexture(std::uint32_t width, std::uint32_t height, std::uint32_t levels = 1) override {
 					if (freeViews.empty()) return 0;
 					TextureEntry entry;
 					const D3D12_HEAP_PROPERTIES gpu = Heap(D3D12_HEAP_TYPE_DEFAULT);
-					D3D12_RESOURCE_DESC description = TextureDescription(width, height, DXGI_FORMAT_B8G8R8A8_UNORM, D3D12_RESOURCE_FLAG_NONE);
+					D3D12_RESOURCE_DESC description = TextureDescription(width, height, DXGI_FORMAT_B8G8R8A8_UNORM, D3D12_RESOURCE_FLAG_NONE,
+						static_cast<UINT16>(levels < 1 ? 1 : levels));
 					if (FAILED(device->CreateCommittedResource(&gpu, D3D12_HEAP_FLAG_NONE, &description, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&entry.texture)))) return 0;
 					entry.width = width;
 					entry.height = height;
@@ -221,10 +264,12 @@ namespace KeeperForge2::Render {
 					textures[handle] = std::move(entry);
 					return handle;
 				}
-				void UpdateTexture(std::uint32_t texture, const void* pixels, std::uint32_t pitch) override {
+				void UpdateTexture(std::uint32_t texture, const void* pixels, std::uint32_t pitch, std::uint32_t level = 0) override {
 					const auto found = textures.find(texture);
 					if (found == textures.end()) return;
-					CopyPixels(found->second.texture.Get(), found->second.width, found->second.height, pixels, pitch, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+					// One texture, so a mip level's subresource is its level.
+					CopyPixels(found->second.texture.Get(), MipLevelSize(found->second.width, level), MipLevelSize(found->second.height, level), pixels, pitch,
+						D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, DXGI_FORMAT_B8G8R8A8_UNORM, 4, level);
 				}
 				void DestroyTexture(std::uint32_t texture) override {
 					const auto found = textures.find(texture);
@@ -423,6 +468,108 @@ namespace KeeperForge2::Render {
 					if (msaaColor) frameUnresolved = true;
 				}
 
+				// ---- The ray tracer (RayScene.h, RayHlsl.h, docs/game/ray-tracing.md): the trace and blur compute passes. The
+				// scene goes into this frame's upload buffer (read as structured buffers), the per-pixel buffers stay on the
+				// card, and the result textures are turned into RGBA pictures the compute pass writes, read for drawing
+				// through the same views as before.
+				bool CanRayTrace() const override { return !rayFailed; }
+				bool TraceAmbientOcclusion(const RaySceneData& scene, const RayTraceSettings& settings, std::uint32_t texture, std::uint32_t reflectionTexture,
+					std::uint32_t bounceTexture) override {
+					if (rayFailed || scene.nodeCount == 0 || settings.width == 0 || settings.height == 0 || !frameColor) return false;
+					if (!rayReady && !MakeRayObjects()) {
+						rayFailed = true;
+						return false;
+					}
+					if (!MakeRayBuffers(settings.width, settings.height)) return false;
+					ID3D12Resource* result = RayWritable(texture, settings.width, settings.height);
+					ID3D12Resource* reflections = reflectionTexture ? RayWritable(reflectionTexture, settings.width, settings.height) : nullptr;
+					ID3D12Resource* bounce = bounceTexture ? RayWritable(bounceTexture, settings.width, settings.height) : nullptr;
+					if (!result || (reflectionTexture && !reflections) || (bounceTexture && !bounce)) return false;
+
+					if (Slot().viewsUsed + RayViews > DescriptorsPerFrame) {
+						FlushAndWait();
+						NoteWait("too many draws for one frame");
+					}
+					// The tree, triangles, lights and settings in one piece of the upload buffer.
+					const UINT64 nodeBytes = static_cast<UINT64>(scene.nodeCount) * sizeof(RayNode);
+					const UINT64 triangleBytes = (std::max<UINT64>)(static_cast<UINT64>(scene.triangleCount) * sizeof(RayTriangle), 16);
+					const UINT64 lightBytes = (std::max<UINT64>)(static_cast<UINT64>(scene.lightCount) * sizeof(RayLight), 32);
+					const UINT64 triangleStart = AlignUp(nodeBytes, ConstantAlignment);
+					const UINT64 lightStart = AlignUp(triangleStart + triangleBytes, ConstantAlignment);
+					const UINT64 settingsStart = AlignUp(lightStart + lightBytes, ConstantAlignment);
+					std::uint8_t* written = nullptr;
+					const UINT64 offset = RingAllocate(settingsStart + ConstantAlignment, ConstantAlignment, written);
+					if (!written) return false;
+					std::memcpy(written, scene.nodes, static_cast<std::size_t>(nodeBytes));
+					std::memcpy(written + triangleStart, scene.triangles, static_cast<std::size_t>(scene.triangleCount) * sizeof(RayTriangle));
+					std::memset(written + lightStart, 0, static_cast<std::size_t>(lightBytes));
+					if (scene.lightCount > 0) std::memcpy(written + lightStart, scene.lights, static_cast<std::size_t>(scene.lightCount) * sizeof(RayLight));
+					std::memcpy(written + settingsStart, &settings, sizeof(settings));
+
+					ID3D12GraphicsCommandList* list = Commands();
+					// The frame is read for reflections and bounce light: resolved first (MSAA).
+					Resolve(list);
+					FrameSlot& frame = Slot();
+					const UINT first = frame.viewsUsed;
+					frame.viewsUsed += RayViews;
+					// t0-t2: the scene, read from the upload buffer; t3: the frame.
+					const UINT64 starts[3] = { offset, offset + triangleStart, offset + lightStart };
+					const UINT64 sizes[3] = { nodeBytes, triangleBytes, lightBytes };
+					for (UINT i = 0; i < 3; ++i) {
+						D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+						view.Format = DXGI_FORMAT_UNKNOWN;
+						view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+						view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+						view.Buffer.FirstElement = starts[i] / 16;
+						view.Buffer.NumElements = static_cast<UINT>(sizes[i] / 16);
+						view.Buffer.StructureByteStride = 16;
+						device->CreateShaderResourceView(frame.ring.Get(), &view, FrameView(frame, first + i));
+					}
+					device->CopyDescriptorsSimple(1, FrameView(frame, first + 3), TextureView(FrameView0), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+					// u0-u4: the trace's result, the reflections, the bounced light before smoothing, the smoothed result and
+					// bounced light (a picture not wanted is written into the scratch picture).
+					const UINT pixels = settings.width * settings.height;
+					const auto bufferView = [&](ID3D12Resource* buffer, UINT stride, UINT slot) {
+						D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+						view.Format = DXGI_FORMAT_UNKNOWN;
+						view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+						view.Buffer.NumElements = pixels;
+						view.Buffer.StructureByteStride = stride;
+						device->CreateUnorderedAccessView(buffer, nullptr, &view, FrameView(frame, first + slot));
+					};
+					bufferView(rayRaw.Get(), 8, 4);
+					bufferView(rayBounceRaw.Get(), 16, 6);
+					device->CreateUnorderedAccessView(reflections ? reflections : rayScratch.Get(), nullptr, nullptr, FrameView(frame, first + 5));
+					device->CreateUnorderedAccessView(result, nullptr, nullptr, FrameView(frame, first + 7));
+					device->CreateUnorderedAccessView(bounce ? bounce : rayScratch.Get(), nullptr, nullptr, FrameView(frame, first + 8));
+
+					// The frame and the result pictures are lent to the compute passes and given back after.
+					std::vector<D3D12_RESOURCE_BARRIER> before{ Transition(frameColor.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) };
+					for (ID3D12Resource* picture : { result, reflections, bounce }) {
+						if (picture) before.push_back(Transition(picture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+					}
+					list->ResourceBarrier(static_cast<UINT>(before.size()), before.data());
+					list->SetComputeRootSignature(raySignature.Get());
+					list->SetComputeRootConstantBufferView(0, frame.ring->GetGPUVirtualAddress() + offset + settingsStart);
+					list->SetComputeRootDescriptorTable(1, FrameGpuView(frame, first));
+					const UINT groupsX = (settings.width + 7) / 8;
+					const UINT groupsY = (settings.height + 7) / 8;
+					D3D12_RESOURCE_BARRIER betweenPasses{};
+					betweenPasses.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+					list->SetPipelineState(rayTrace.Get());
+					list->Dispatch(groupsX, groupsY, 1);
+					list->ResourceBarrier(1, &betweenPasses);
+					list->SetPipelineState(rayBlur.Get());
+					list->Dispatch(groupsX, groupsY, 1);
+					list->ResourceBarrier(1, &betweenPasses);
+					std::vector<D3D12_RESOURCE_BARRIER> after{ Transition(frameColor.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET) };
+					for (ID3D12Resource* picture : { result, reflections, bounce }) {
+						if (picture) after.push_back(Transition(picture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+					}
+					list->ResourceBarrier(static_cast<UINT>(after.size()), after.data());
+					return true;
+				}
+
 				void UploadScreen(const void* pixels, std::uint32_t width, std::uint32_t height, std::uint32_t pitch) override {
 					if (!screen || width != screenWidth || height != screenHeight) {
 						FlushAndWait();
@@ -526,6 +673,8 @@ namespace KeeperForge2::Render {
 					UINT viewsUsed = 0;
 					UINT64 fenceValue = 0;
 					std::vector<TextureEntry> doomed;
+					// Pictures replaced while recorded work may still use them (the ray tracer's results), freed with the frame.
+					std::vector<ComPtr<ID3D12Resource>> doomedResources;
 				};
 
 				HWND window = nullptr;
@@ -574,6 +723,113 @@ namespace KeeperForge2::Render {
 				std::uint64_t midFrameWaits = 0;
 				std::uint64_t nextWaitReport = 1;
 				std::uint32_t slowPipelines = 0;
+
+				// ---- The ray tracer: its signature (b0 settings; a table of t0-t3 and u0-u4; s0 linear clamped), the two
+				// compute pipelines, the per-pixel buffers and a scratch picture for results not wanted, made for one size,
+				// and the textures already turned into writable pictures.
+				bool rayReady = false;
+				bool rayFailed = false;
+				ComPtr<ID3D12RootSignature> raySignature;
+				ComPtr<ID3D12PipelineState> rayTrace;
+				ComPtr<ID3D12PipelineState> rayBlur;
+				ComPtr<ID3D12Resource> rayRaw;
+				ComPtr<ID3D12Resource> rayBounceRaw;
+				ComPtr<ID3D12Resource> rayScratch;
+				std::uint32_t rayWidth = 0;
+				std::uint32_t rayHeight = 0;
+				std::unordered_set<std::uint32_t> rayPictures;
+				static constexpr UINT RayViews = 9;
+				bool MakeRayObjects() {
+					D3D12_DESCRIPTOR_RANGE ranges[2] = { { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 0, 0 }, { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 5, 0, 0, 4 } };
+					D3D12_ROOT_PARAMETER parameters[2]{};
+					parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+					parameters[0].Descriptor = { 0, 0 };
+					parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+					parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+					parameters[1].DescriptorTable = { 2, ranges };
+					parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+					D3D12_STATIC_SAMPLER_DESC sampler{};
+					sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+					sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+					sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+					sampler.MaxLOD = D3D12_FLOAT32_MAX;
+					sampler.ShaderRegister = 0;
+					sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+					if (!MakeSignature(parameters, 2, D3D12_ROOT_SIGNATURE_FLAG_NONE, raySignature, &sampler, 1)) {
+						Logger::Warning("Ray tracing: DirectX 12 could not make the tracer's signature; ray tracing is off.");
+						return false;
+					}
+					const char* entries[2] = { "TraceMain", "BlurMain" };
+					ComPtr<ID3D12PipelineState>* made[2] = { &rayTrace, &rayBlur };
+					for (int i = 0; i < 2; ++i) {
+						ComPtr<ID3DBlob> code;
+						if (!CompileHlsl(Shaders::RayHlsl, entries[i], "cs_5_0", code)) {
+							Logger::Warning("Ray tracing: DirectX 12 could not compile the tracer's shaders; ray tracing is off.");
+							return false;
+						}
+						D3D12_COMPUTE_PIPELINE_STATE_DESC description{};
+						description.pRootSignature = raySignature.Get();
+						description.CS = { code->GetBufferPointer(), code->GetBufferSize() };
+						const HRESULT result = device->CreateComputePipelineState(&description, IID_PPV_ARGS(made[i]->ReleaseAndGetAddressOf()));
+						if (FAILED(result)) {
+							Logger::Warning("Ray tracing: DirectX 12 could not make the tracer's pipelines (" + HexResult(result) + "); ray tracing is off.");
+							return false;
+						}
+					}
+					rayReady = true;
+					Logger::Info("Ray tracing: DirectX 12's tracer is ready (compute shaders).");
+					return true;
+				}
+				bool MakeRayBuffers(std::uint32_t width, std::uint32_t height) {
+					if (width == rayWidth && height == rayHeight && rayRaw && rayBounceRaw && rayScratch) return true;
+					// The old ones may still be in use by work in flight.
+					FlushAndWait();
+					WaitIdle();
+					rayRaw.Reset();
+					rayBounceRaw.Reset();
+					rayScratch.Reset();
+					rayWidth = rayHeight = 0;
+					const D3D12_HEAP_PROPERTIES gpu = Heap(D3D12_HEAP_TYPE_DEFAULT);
+					const UINT64 pixels = static_cast<UINT64>(width) * height;
+					D3D12_RESOURCE_DESC rawDescription = BufferDescription(pixels * 8);
+					rawDescription.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+					D3D12_RESOURCE_DESC bounceDescription = BufferDescription(pixels * 16);
+					bounceDescription.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+					D3D12_RESOURCE_DESC scratchDescription = TextureDescription(width, height, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+					if (FAILED(device->CreateCommittedResource(&gpu, D3D12_HEAP_FLAG_NONE, &rawDescription, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&rayRaw)))
+						|| FAILED(device->CreateCommittedResource(&gpu, D3D12_HEAP_FLAG_NONE, &bounceDescription, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&rayBounceRaw)))
+						|| FAILED(device->CreateCommittedResource(&gpu, D3D12_HEAP_FLAG_NONE, &scratchDescription, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&rayScratch)))) {
+						Logger::Warning("Ray tracing: DirectX 12 could not make the tracer's buffers for " + std::to_string(width) + "x" + std::to_string(height) + ".");
+						rayRaw.Reset();
+						rayBounceRaw.Reset();
+						rayScratch.Reset();
+						return false;
+					}
+					rayWidth = width;
+					rayHeight = height;
+					return true;
+				}
+				// The texture behind a handle, turned (once) into an RGBA picture the compute pass can write, resting where
+				// textures rest; its view for drawing (the same slot) shows the new picture. The old one goes with the frame.
+				ID3D12Resource* RayWritable(std::uint32_t handle, std::uint32_t width, std::uint32_t height) {
+					const auto found = textures.find(handle);
+					if (found == textures.end() || found->second.width != width || found->second.height != height) return nullptr;
+					TextureEntry& entry = found->second;
+					if (!rayPictures.contains(handle)) {
+						const D3D12_HEAP_PROPERTIES gpu = Heap(D3D12_HEAP_TYPE_DEFAULT);
+						D3D12_RESOURCE_DESC description = TextureDescription(width, height, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+						ComPtr<ID3D12Resource> picture;
+						if (FAILED(device->CreateCommittedResource(&gpu, D3D12_HEAP_FLAG_NONE, &description, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&picture)))) {
+							return nullptr;
+						}
+						Commands();
+						Slot().doomedResources.push_back(entry.texture);
+						entry.texture = picture;
+						device->CreateShaderResourceView(entry.texture.Get(), nullptr, TextureView(entry.view));
+						rayPictures.insert(handle);
+					}
+					return entry.texture.Get();
+				}
 
 				// ---- Anti-aliasing (see AntiAliasing in Backend.h).
 				// MSAA: samples per pixel (1 = off), the multisampled color the draws go into, and whether it holds
@@ -848,6 +1104,11 @@ namespace KeeperForge2::Render {
 						}
 						else {
 							description.Filter = (key & 16) != 0 ? D3D12_FILTER_MIN_MAG_MIP_LINEAR : D3D12_FILTER_MIN_MAG_MIP_POINT;
+							// texture_filtering: anisotropic for the linear ones (the game's 3D textures).
+							if ((key & 16) != 0 && anisotropy > 1) {
+								description.Filter = D3D12_FILTER_ANISOTROPIC;
+								description.MaxAnisotropy = anisotropy;
+							}
 							// SamplerState::Key: address U - 1 in bits 0-1, V - 1 in bits 2-3; D3D12 numbers its modes as Direct3D 6 does.
 							description.AddressU = static_cast<D3D12_TEXTURE_ADDRESS_MODE>((key & 3) + 1);
 							description.AddressV = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(((key >> 2) & 3) + 1);
@@ -1058,6 +1319,7 @@ namespace KeeperForge2::Render {
 					WaitFor(frame.fenceValue);
 					for (const TextureEntry& entry : frame.doomed) freeViews.push_back(entry.view);
 					frame.doomed.clear();
+					frame.doomedResources.clear();
 					frame.ringUsed = 0;
 					frame.viewsUsed = 0;
 					frame.allocator->Reset();
@@ -1132,7 +1394,7 @@ namespace KeeperForge2::Render {
 				}
 				// A whole texture from memory, through this frame's upload buffer; the resource is left in state "after".
 				void CopyPixels(ID3D12Resource* resource, std::uint32_t width, std::uint32_t height, const void* pixels, std::uint32_t pitch, D3D12_RESOURCE_STATES after,
-					DXGI_FORMAT format = DXGI_FORMAT_B8G8R8A8_UNORM, UINT bytesPerPixel = 4) {
+					DXGI_FORMAT format = DXGI_FORMAT_B8G8R8A8_UNORM, UINT bytesPerPixel = 4, UINT subresource = 0) {
 					const UINT rowPitch = static_cast<UINT>(AlignUp(static_cast<UINT64>(width) * bytesPerPixel, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT));
 					std::uint8_t* written = nullptr;
 					const UINT64 offset = RingAllocate(static_cast<UINT64>(rowPitch) * height, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, written);
@@ -1149,6 +1411,7 @@ namespace KeeperForge2::Render {
 					D3D12_TEXTURE_COPY_LOCATION to{};
 					to.pResource = resource;
 					to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+					to.SubresourceIndex = subresource;
 					list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
 					barrier = Transition(resource, D3D12_RESOURCE_STATE_COPY_DEST, after);
 					list->ResourceBarrier(1, &barrier);

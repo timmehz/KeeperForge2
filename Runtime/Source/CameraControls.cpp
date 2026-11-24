@@ -196,26 +196,31 @@ namespace KeeperForge2 {
 		// by default.)
 		constexpr std::uint32_t MouseOffsetMiddle = 0xE;
 		constexpr std::uintptr_t MouseData = 0x30;
+		// From DirectInput's data or Windows' messages (WindowsMouse).
+		void MiddlePressed() {
+			if (cameraReset) resetClick = (std::max)(GetTickCount64(), 1ull);
+		}
+		void WheelTurned(std::int32_t delta) {
+			if (!wheelZoom || delta == 0) return;
+			const std::int32_t notches = (std::max)(1, std::abs(delta) / WheelNotch);
+			const std::int32_t direction = delta > 0 ? 1 : -1;
+			// Turning the other way replaces what was left of the last turn.
+			const std::int32_t left = zoomPolls.load();
+			const std::int32_t kept = left * direction > 0 ? left : 0;
+			zoomPolls = std::clamp(kept + direction * notches * ZoomPollsPerNotch, -MaxZoomPolls, MaxZoomPolls);
+			lastWheel = GetTickCount64();
+		}
 		using MouseDataFn = void(__fastcall*)(std::uint8_t* mouse, void* unused, std::int32_t count);
 		MouseDataFn originalMouseData = nullptr;
 		void __fastcall MouseDataDetour(std::uint8_t* mouse, void* unused, std::int32_t count) {
 			const auto* data = *reinterpret_cast<const std::uint8_t* const*>(mouse + MouseData);
 			for (std::int32_t i = 0; data != nullptr && i < count; ++i) {
 				const auto* entry = data + static_cast<std::size_t>(i) * MouseDataEntrySize;
-				if (cameraReset && Load<std::uint32_t>(entry) == MouseOffsetMiddle) {
-					if ((Load<std::uint32_t>(entry + 4) & 0x80) != 0) resetClick = (std::max)(GetTickCount64(), 1ull);
+				if (Load<std::uint32_t>(entry) == MouseOffsetMiddle) {
+					if ((Load<std::uint32_t>(entry + 4) & 0x80) != 0) MiddlePressed();
 					continue;
 				}
-				if (!wheelZoom || Load<std::uint32_t>(entry) != MouseOffsetWheel) continue;
-				const auto delta = Load<std::int32_t>(entry + 4);
-				if (delta == 0) continue;
-				const std::int32_t notches = (std::max)(1, std::abs(delta) / WheelNotch);
-				const std::int32_t direction = delta > 0 ? 1 : -1;
-				// Turning the other way replaces what was left of the last turn.
-				const std::int32_t left = zoomPolls.load();
-				const std::int32_t kept = left * direction > 0 ? left : 0;
-				zoomPolls = std::clamp(kept + direction * notches * ZoomPollsPerNotch, -MaxZoomPolls, MaxZoomPolls);
-				lastWheel = GetTickCount64();
+				if (Load<std::uint32_t>(entry) == MouseOffsetWheel) WheelTurned(Load<std::int32_t>(entry + 4));
 			}
 			originalMouseData(mouse, unused, count);
 		}
@@ -229,9 +234,42 @@ namespace KeeperForge2 {
 		bool SettingOn(const char* name) {
 			return StringUtils::ToLower(Config::GetString(name, "on")) != "off";
 		}
+
+		// ---- Wider zoom. Ported from Flame: increase_zoom_level (its amounts: 2000 closer when the minimum allows,
+		// 50000 further out). Only for the zoom by an amount (keys, wheel); the limits are widened around the game's own
+		// zoom and put back after, so nothing else sees them.
+		constexpr std::int32_t ZoomInMore = 2000;
+		constexpr std::int32_t ZoomOutMore = 50000;
+		using ZoomByFn = void(__fastcall*)(std::uint8_t* camera, void* unused, std::int32_t amount);
+		ZoomByFn originalZoomBy = nullptr;
+		void __fastcall ZoomByDetour(std::uint8_t* camera, void* unused, std::int32_t amount) {
+			auto& minimum = *reinterpret_cast<std::int32_t*>(camera + Game::Offset::CameraZoomMin);
+			auto& maximum = *reinterpret_cast<std::int32_t*>(camera + Game::Offset::CameraZoomMax);
+			const std::int32_t keptMinimum = minimum;
+			const std::int32_t keptMaximum = maximum;
+			if (minimum > ZoomInMore) minimum -= ZoomInMore;
+			maximum += ZoomOutMore;
+			originalZoomBy(camera, unused, amount);
+			minimum = keptMinimum;
+			maximum = keptMaximum;
+		}
+		void InstallWideZoom() {
+			if (!SettingOn("wide_zoom")) return;
+			// "test byte [ecx+0xD92], 8; jnz; mov eax, [ecx+0xDD8]"
+			if (!Hook(Game::Resolve(Game::Address::CameraZoomBy), { 0xF6, 0x81, 0x92, 0x0D, 0x00, 0x00, 0x08, 0x75, 0x52, 0x8B, 0x81, 0xD8, 0x0D, 0x00, 0x00 },
+				reinterpret_cast<void*>(&ZoomByDetour), reinterpret_cast<void**>(&originalZoomBy))) {
+				Logger::Warning("Camera controls: unexpected game code at the camera's zoom, the wider zoom is off.");
+				return;
+			}
+			Logger::Info("Camera controls: wider zoom range on.");
+		}
 	}
 
+	void CameraControls::OnMouseWheel(std::int32_t delta) { WheelTurned(delta); }
+	void CameraControls::OnMiddleButton() { MiddlePressed(); }
+
 	void CameraControls::Install() {
+		InstallWideZoom();
 		const bool wantWasd = SettingOn("wasd_camera");
 		const bool wantWheel = SettingOn("wheel_zoom");
 		const bool wantReset = SettingOn("middle_click_camera_reset");

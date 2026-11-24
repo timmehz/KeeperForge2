@@ -67,6 +67,7 @@ namespace KeeperForge2::Render::Vk {
 		PipelineColorBlendStateCreateInfo = 26,
 		PipelineDynamicStateCreateInfo = 27,
 		GraphicsPipelineCreateInfo = 28,
+		ComputePipelineCreateInfo = 29,
 		PipelineLayoutCreateInfo = 30,
 		SamplerCreateInfo = 31,
 		DescriptorSetLayoutCreateInfo = 32,
@@ -80,6 +81,7 @@ namespace KeeperForge2::Render::Vk {
 		CommandBufferBeginInfo = 42,
 		RenderPassBeginInfo = 43,
 		ImageMemoryBarrier = 45,
+		MemoryBarrier = 46,
 		SwapchainCreateInfoKHR = 1000001000,
 		PresentInfoKHR = 1000001001,
 		Win32SurfaceCreateInfoKHR = 1000009000,
@@ -121,6 +123,7 @@ namespace KeeperForge2::Render::Vk {
 	constexpr std::uint32_t BufferUsageTransferSrc = 0x1;
 	constexpr std::uint32_t BufferUsageTransferDst = 0x2;
 	constexpr std::uint32_t BufferUsageUniform = 0x10;
+	constexpr std::uint32_t BufferUsageStorage = 0x20;
 	constexpr std::uint32_t BufferUsageIndex = 0x40;
 	constexpr std::uint32_t BufferUsageVertex = 0x80;
 	constexpr std::uint32_t AspectColor = 0x1;
@@ -133,10 +136,12 @@ namespace KeeperForge2::Render::Vk {
 	constexpr std::uint32_t StageEarlyFragmentTests = 0x100;
 	constexpr std::uint32_t StageLateFragmentTests = 0x200;
 	constexpr std::uint32_t StageColorAttachmentOutput = 0x400;
+	constexpr std::uint32_t StageComputeShader = 0x800;
 	constexpr std::uint32_t StageTransfer = 0x1000;
 	constexpr std::uint32_t StageBottomOfPipe = 0x2000;
 	constexpr std::uint32_t StageHost = 0x4000;
 	constexpr std::uint32_t AccessShaderRead = 0x20;
+	constexpr std::uint32_t AccessShaderWrite = 0x40;
 	constexpr std::uint32_t AccessColorAttachmentRead = 0x80;
 	constexpr std::uint32_t AccessColorAttachmentWrite = 0x100;
 	constexpr std::uint32_t AccessDepthStencilRead = 0x200;
@@ -147,13 +152,22 @@ namespace KeeperForge2::Render::Vk {
 	constexpr std::uint32_t AccessMemoryRead = 0x8000;
 	constexpr std::uint32_t FormatFeatureDepthStencilAttachment = 0x200;
 	constexpr std::uint32_t QueueFamilyIgnored = 0xFFFFFFFF;
+	// VK_REMAINING_MIP_LEVELS and VK_LOD_CLAMP_NONE.
+	constexpr std::uint32_t RemainingMipLevels = 0xFFFFFFFF;
+	constexpr float LodClampNone = 1000.0f;
+	// VkPhysicalDeviceFeatures: its Bool32 count, and samplerAnisotropy's place among them.
+	constexpr std::size_t PhysicalDeviceFeatureCount = 55;
+	constexpr std::size_t FeatureSamplerAnisotropy = 19;
 	constexpr std::uint32_t SubpassExternal = 0xFFFFFFFF;
 	constexpr std::uint32_t CompositeOpaque = 0x1;
 	constexpr std::uint32_t TransformIdentity = 0x1;
 	constexpr std::uint32_t DescriptorCombinedImageSampler = 1;
 	constexpr std::uint32_t DescriptorUniformBuffer = 6;
+	constexpr std::uint32_t DescriptorStorageBuffer = 7;
 	constexpr std::uint32_t ShaderVertex = 0x1;
 	constexpr std::uint32_t ShaderFragment = 0x10;
+	constexpr std::uint32_t ShaderCompute = 0x20;
+	constexpr std::int32_t BindPointCompute = 1;
 	constexpr std::uint32_t PhysicalDeviceDiscrete = 2;
 	constexpr std::uint32_t ApiVersion10 = 1u << 22;
 
@@ -327,6 +341,12 @@ namespace KeeperForge2::Render::Vk {
 	struct ClearAttachment { Flags aspectMask; std::uint32_t colorAttachment; ClearValue clearValue; };
 	struct ClearRect { Rect2D rect; std::uint32_t baseArrayLayer; std::uint32_t layerCount; };
 	struct PushConstantRange { Flags stageFlags; std::uint32_t offset; std::uint32_t size; };
+	// The ray tracer's compute passes.
+	struct ComputePipelineCreateInfoData {
+		StructureType sType; const void* pNext; Flags flags; PipelineShaderStageCreateInfoData stage; PipelineLayout layout; Pipeline basePipelineHandle;
+		std::int32_t basePipelineIndex;
+	};
+	struct MemoryBarrierData { StructureType sType; const void* pNext; Flags srcAccessMask; Flags dstAccessMask; };
 	struct ImageFormatProperties { Extent3D maxExtent; std::uint32_t maxMipLevels; std::uint32_t maxArrayLayers; Flags sampleCounts; DeviceSize maxResourceSize; };
 	static_assert(sizeof(ImageFormatProperties) == 32);
 	struct ImageResolve { ImageSubresourceLayers srcSubresource; Offset3D srcOffset; ImageSubresourceLayers dstSubresource; Offset3D dstOffset; Extent3D extent; };
@@ -341,6 +361,8 @@ namespace KeeperForge2::Render::Vk {
 		void(__stdcall* DestroyInstance)(Instance, const void*);
 		Result(__stdcall* EnumeratePhysicalDevices)(Instance, std::uint32_t*, PhysicalDevice*);
 		void(__stdcall* GetPhysicalDeviceProperties)(PhysicalDevice, void*);
+		// VkPhysicalDeviceFeatures: PhysicalDeviceFeatureCount Bool32s.
+		void(__stdcall* GetPhysicalDeviceFeatures)(PhysicalDevice, Bool32*);
 		void(__stdcall* GetPhysicalDeviceQueueFamilyProperties)(PhysicalDevice, std::uint32_t*, QueueFamilyProperties*);
 		void(__stdcall* GetPhysicalDeviceMemoryProperties)(PhysicalDevice, PhysicalDeviceMemoryProperties*);
 		void(__stdcall* GetPhysicalDeviceFormatProperties)(PhysicalDevice, Format, FormatProperties*);
@@ -429,5 +451,8 @@ namespace KeeperForge2::Render::Vk {
 		void(__stdcall* CmdDraw)(CommandBuffer, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t);
 		void(__stdcall* CmdPushConstants)(CommandBuffer, PipelineLayout, Flags, std::uint32_t, std::uint32_t, const void*);
 		void(__stdcall* CmdResolveImage)(CommandBuffer, Image, ImageLayout, Image, ImageLayout, std::uint32_t, const ImageResolve*);
+		// The ray tracer (compute; core Vulkan 1.0).
+		Result(__stdcall* CreateComputePipelines)(Device, PipelineCache, std::uint32_t, const ComputePipelineCreateInfoData*, const void*, Pipeline*);
+		void(__stdcall* CmdDispatch)(CommandBuffer, std::uint32_t, std::uint32_t, std::uint32_t);
 	};
 }

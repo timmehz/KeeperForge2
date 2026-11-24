@@ -1,0 +1,68 @@
+#version 450
+// Smooths ray_ao.comp's result (see docs/game/ray-tracing.md): a blur over the neighbours that keeps edges, by only
+// mixing in pixels at nearly the same depth. Writes the texture's pixels (BGRA, gray) for the copy into it, and the
+// bounced light the same way (BGRA, colored, scaled by its strength).
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, binding = 2) readonly buffer Raw { vec2 raw[]; };
+layout(std430, binding = 3) writeonly buffer Result { uint result[]; };
+layout(std430, binding = 7) readonly buffer BounceRaw { vec4 bounceRaw[]; };
+layout(std430, binding = 8) writeonly buffer Bounce { uint bounce[]; };
+
+// RayTraceSettings in Backend.h.
+layout(push_constant) uniform Settings {
+	uvec2 size;
+	vec2 frameSize;
+	vec2 center;
+	float focal;
+	float radius;
+	uint rays;
+	uint frame;
+	uint nodeCount;
+	uint triangleCount;
+	uint lightCount;
+	float occlusion;
+	float shadows;
+	float ambient;
+	float reflections;
+	float reflectReach;
+	float bounce;
+	float bounceReach;
+} settings;
+
+const int Reach = 3;
+
+void main() {
+	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 size = ivec2(settings.size);
+	if (pixel.x >= size.x || pixel.y >= size.y) return;
+	vec2 here = raw[pixel.y * size.x + pixel.x];
+	float open = 1.0;
+	vec3 light = vec3(0.0);
+	if (here.y > 0.0) {
+		float sum = 0.0;
+		vec3 lightSum = vec3(0.0);
+		float weights = 0.0;
+		for (int dy = -Reach; dy <= Reach; ++dy) {
+			for (int dx = -Reach; dx <= Reach; ++dx) {
+				ivec2 other = clamp(pixel + ivec2(dx, dy), ivec2(0), size - 1);
+				vec2 value = raw[other.y * size.x + other.x];
+				if (value.y <= 0.0) continue;
+				// Close in place and in depth (relative, as depth grows with distance).
+				float spread = exp(-float(dx * dx + dy * dy) / (2.0 * 2.0 * 2.0));
+				float depthWeight = exp(-abs(value.y - here.y) / (here.y * 0.02 + 1e-6));
+				float weight = spread * depthWeight;
+				sum += value.x * weight;
+				lightSum += bounceRaw[other.y * size.x + other.x].rgb * weight;
+				weights += weight;
+			}
+		}
+		open = weights > 0.0 ? sum / weights : here.x;
+		light = weights > 0.0 ? lightSum / weights : bounceRaw[pixel.y * size.x + pixel.x].rgb;
+	}
+	uint gray = uint(clamp(open, 0.0, 1.0) * 255.0 + 0.5);
+	// BGRA in memory: blue in the low byte.
+	result[pixel.y * size.x + pixel.x] = 0xFF000000u | (gray << 16) | (gray << 8) | gray;
+	uvec3 bytes = uvec3(clamp(light * settings.bounce, 0.0, 1.0) * 255.0 + 0.5);
+	bounce[pixel.y * size.x + pixel.x] = 0xFF000000u | (bytes.r << 16) | (bytes.g << 8) | bytes.b;
+}
